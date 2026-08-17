@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.agent.backend_factory import build_backend_sync, kill_backend
 from app.agent.factory import build_agent, get_llm
-from app.agent.runtime import SSEEventMapper, run_agent, stream_agent
+from app.agent.runtime import SSEEventMapper, build_multimodal_input, run_agent, stream_agent
 from app.core.config import get_settings
 from app.core.deps import get_current_user
 from app.db.models import User
@@ -73,15 +73,25 @@ async def send_message(
     svc.maybe_set_title(db, conv, body.content)
     svc.touch_conversation(db, conv.id)
 
+    settings = get_settings()
+    user_content = await build_multimodal_input(
+        body.content,
+        body.image_paths,
+        user_id=str(user.id),
+        s3_client=request.app.state.s3,
+        bucket=settings.rustfs_bucket,
+        supports_vision=settings.llm_supports_vision,
+    )
+
     agent, backend, thread_id = await _prepare_run(request, user, conv.id)
     config = {"configurable": {"thread_id": thread_id}}
     started = time.perf_counter()
     logger.info(
-        "agent run start: conversation=%s thread=%s mode=invoke content_len=%d",
-        conv.id, thread_id, len(body.content),
+        "agent run start: conversation=%s thread=%s mode=invoke content_len=%d images=%d vision=%s",
+        conv.id, thread_id, len(body.content), len(body.image_paths or []), settings.llm_supports_vision,
     )
     try:
-        result = await run_agent(agent, content=body.content, config=config)
+        result = await run_agent(agent, content=user_content, config=config)
     finally:
         await kill_backend(backend)
     logger.info(
@@ -111,6 +121,16 @@ async def stream_chat(
     if not await limiter.try_acquire(user_key):
         raise HTTPException(status_code=429, detail="已有进行中的会话，请稍候")
 
+    settings = get_settings()
+    user_content = await build_multimodal_input(
+        body.content,
+        body.image_paths,
+        user_id=str(user.id),
+        s3_client=request.app.state.s3,
+        bucket=settings.rustfs_bucket,
+        supports_vision=settings.llm_supports_vision,
+    )
+
     try:
         # Mirror the user message up front.
         svc.add_message(db, conv.id, "user", body.content)
@@ -129,21 +149,25 @@ async def stream_chat(
     )
 
     async def gen():
+        # Register this task so the stop endpoint can cancel it.
+        task = asyncio.current_task()
+        request.app.state.active_streams[str(conv.id)] = task
+
         started = time.perf_counter()
         logger.info(
-            "agent stream start: conversation=%s thread=%s content_len=%d",
-            conv.id, thread_id, len(body.content),
+            "agent stream start: conversation=%s thread=%s content_len=%d images=%d vision=%s",
+            conv.id, thread_id, len(body.content), len(body.image_paths or []), settings.llm_supports_vision,
         )
         completed = False
         try:
-            async for event in stream_agent(agent, mapper, content=body.content, config=config):
+            async for event in stream_agent(agent, mapper, content=user_content, config=config):
                 yield event
             completed = True
         except asyncio.CancelledError:
-            # Client disconnected: stop streaming; the finally block releases
-            # the sandbox and the limiter.
+            # Client disconnected or /stop was called: stop streaming; the
+            # finally block releases the sandbox and the limiter.
             logger.warning(
-                "agent stream cancelled by client: thread=%s elapsed=%.0fms",
+                "agent stream cancelled: thread=%s elapsed=%.0fms",
                 thread_id, (time.perf_counter() - started) * 1000,
             )
             raise
@@ -151,6 +175,7 @@ async def stream_chat(
             logger.exception("agent stream failed: thread=%s", thread_id)
             yield mapper.error_event("agent_error", str(exc)[:300])
         finally:
+            request.app.state.active_streams.pop(str(conv.id), None)
             await kill_backend(backend)
             limiter.release(user_key)
             logger.info(
@@ -176,3 +201,23 @@ async def stream_chat(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/conversations/{conversation_id}/stop")
+async def stop_generation(
+    conversation_id: uuid.UUID,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cancel an in-progress agent stream for this conversation."""
+    # Verify ownership.
+    svc.get_or_404(db, conversation_id, user.id)
+
+    task = request.app.state.active_streams.get(str(conversation_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="没有正在进行的生成任务")
+
+    task.cancel()
+    logger.info("stop requested: conversation=%s", conversation_id)
+    return {"status": "cancelling"}

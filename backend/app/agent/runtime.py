@@ -1,5 +1,8 @@
 """Agent execution helpers: invoke + SSE event mapping via ``astream_events`` v3.
 
+Provides ``build_multimodal_input`` to convert user-uploaded images (stored in
+RustFS ``/files/``) into base64 data URLs so a vision-capable LLM can see them.
+
 All agent runs go through this module so lifecycle rules (sandbox cleanup,
 mirror writes) live in one place.
 
@@ -25,12 +28,17 @@ above were verified against langgraph 1.2.11.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
+import posixpath
 import uuid
 from dataclasses import dataclass
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+
+ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +67,83 @@ def extract_assistant_text(messages: list[BaseMessage]) -> str:
     return ""
 
 
-async def run_agent(agent, *, content: str, config: dict) -> AgentRunResult:
+async def build_multimodal_input(
+    content: str,
+    image_paths: list[str] | None,
+    *,
+    user_id: str,
+    s3_client,
+    bucket: str,
+    supports_vision: bool = False,
+) -> list | str:
+    """Build the user message ``content`` payload for the agent.
+
+    If ``image_paths`` is non-empty and ``supports_vision`` is True, each
+    ``/files/...`` path is loaded from RustFS via S3, encoded to a base64
+    ``data:image/...;base64,...`` URL, and included alongside the text in a
+    list-of-blocks format compatible with LangChain's vision-enabled
+    ``ChatOpenAI`` client.
+
+    If the model does NOT support vision, image filenames are appended to the
+    text as a plain-text note (the agent cannot see pixels but at least knows
+    something was attached) instead of silently dropping them.
+
+    When no images are provided the function returns the raw ``content``
+    string, preserving the existing code path for non-vision models.
+    """
+    if not image_paths:
+        return content
+
+    valid_paths: list[str] = []
+    for vpath in image_paths:
+        if not isinstance(vpath, str) or not vpath.startswith("/files/"):
+            continue
+        clean = posixpath.normpath(vpath.lstrip("/"))
+        if clean == ".." or clean.startswith("../"):
+            continue
+        _, ext = posixpath.splitext(clean)
+        if ext.lower() not in ALLOWED_IMAGE_EXT:
+            continue
+        valid_paths.append((vpath, clean))
+
+    if not valid_paths:
+        return content
+
+    if not supports_vision:
+        # Graceful degradation: mention the images in text so the user knows
+        # why the model didn't analyse them.
+        names = ", ".join(posixpath.basename(p) for _, p in valid_paths)
+        appendix = (
+            f"\n\n[系统提示] 用户上传了 {len(valid_paths)} 张图片：{names}。"
+            "但当前配置的 LLM_MODEL 未启用视觉能力 (LLM_SUPPORTS_VISION=false)，"
+            "请在 .env 中切换到支持视觉的模型并设置 LLM_SUPPORTS_VISION=true。"
+        )
+        return content + appendix
+
+    blocks: list = [{"type": "text", "text": content}]
+    for vpath, clean in valid_paths:
+        key = f"users/{user_id}/{clean}"
+        try:
+            obj = s3_client.get_object(Bucket=bucket, Key=key)
+            raw = obj["Body"].read()
+            ctype = obj.get("ContentType") or mimetypes.guess_type(clean)[0] or "image/png"
+        except Exception as exc:
+            logger.warning("multimodal: failed to read %s: %s", vpath, exc)
+            continue
+        b64 = base64.b64encode(raw).decode("ascii")
+        blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{ctype};base64,{b64}"},
+        })
+    return blocks if len(blocks) > 1 else content
+
+
+async def run_agent(
+    agent,
+    *,
+    content: list | str,
+    config: dict,
+) -> AgentRunResult:
     """Invoke the agent once (non-streaming) and return the assistant text."""
     result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": content}]},
@@ -229,7 +313,7 @@ async def stream_agent(
     agent,
     mapper: SSEEventMapper,
     *,
-    content: str,
+    content: list | str,
     config: dict,
 ):
     """Async generator: SSE event strings for one agent run (astream_events v3).

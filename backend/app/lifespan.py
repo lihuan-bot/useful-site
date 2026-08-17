@@ -141,6 +141,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("rag disabled: EMBEDDING_BASE_URL not configured")
     app.state.user_limiter = _build_limiter(settings)
+    app.state.active_streams = {}  # conversation_id -> asyncio.Task
 
     # 4) OpenSandbox pool warmup (Phase 4+). Blocking; must run off the loop.
     import asyncio

@@ -49,6 +49,10 @@ class ConversationDetail(ConversationOut):
 
 class ChatRequest(BaseModel):
     content: str = Field(min_length=1, max_length=100_000)
+    image_paths: list[str] | None = Field(
+        default=None,
+        description="User-uploaded image paths under /files/, e.g. /files/20250101/abc12345-cat.png",
+    )
 
 
 class ChatResponse(BaseModel):

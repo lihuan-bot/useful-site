@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"
     llm_temperature: float = 0.7
+    llm_supports_vision: bool = False
 
     # --- Embedding (independent OpenAI-compatible endpoint) ---
     embedding_base_url: str = ""
