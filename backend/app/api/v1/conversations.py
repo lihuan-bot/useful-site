@@ -1,0 +1,90 @@
+"""Conversation CRUD and history endpoints."""
+
+from __future__ import annotations
+
+import logging
+import uuid
+
+from fastapi import APIRouter, Depends, Query, Request
+from sqlalchemy.orm import Session
+
+from app.core.deps import get_current_user
+from app.db.models import User
+from app.db.session import get_db
+from app.schemas.conversation import (
+    ConversationCreate,
+    ConversationDetail,
+    ConversationList,
+    ConversationOut,
+    MessageList,
+    MessageOut,
+)
+from app.services import conversation_service as svc
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+
+@router.get("", response_model=ConversationList)
+def list_conversations(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ConversationList:
+    rows, total = svc.list_conversations(db, user.id, limit=limit, offset=offset)
+    return ConversationList(items=rows, total=total)
+
+
+@router.post("", response_model=ConversationOut, status_code=201)
+def create_conversation(
+    body: ConversationCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Conversation:
+    conv = svc.create_conversation(db, user, body.title)
+    logger.info("conversation created: id=%s", conv.id)
+    return conv
+
+
+@router.get("/{conversation_id}", response_model=ConversationDetail)
+def get_conversation(
+    conversation_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ConversationDetail:
+    conv = svc.get_or_404(db, conversation_id, user.id)
+    messages, _ = svc.list_messages(db, conv.id, limit=200, offset=0)
+    detail = ConversationDetail.model_validate(conv)
+    detail.messages = [MessageOut.model_validate(m) for m in messages]
+    return detail
+
+
+@router.delete("/{conversation_id}", status_code=204)
+async def delete_conversation(
+    conversation_id: uuid.UUID,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    conv = svc.get_or_404(db, conversation_id, user.id)
+    svc.delete_conversation(db, conv)
+    # Remove the agent thread from the checkpointer (all 3 checkpoint tables).
+    checkpointer = request.app.state.checkpointer
+    if checkpointer is not None:
+        await checkpointer.saver.adelete_thread(svc.thread_id_for(user.id, conversation_id))
+    logger.info("conversation deleted: id=%s", conversation_id)
+
+
+@router.get("/{conversation_id}/messages", response_model=MessageList)
+def list_messages(
+    conversation_id: uuid.UUID,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MessageList:
+    conv = svc.get_or_404(db, conversation_id, user.id)
+    rows, total = svc.list_messages(db, conv.id, limit=limit, offset=offset)
+    return MessageList(items=rows, total=total)
