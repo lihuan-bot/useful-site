@@ -8,13 +8,12 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.deps import get_current_user
+from app.core.deps import get_bucket, get_current_user, get_s3
 from app.db.models import User
 from app.db.session import get_db
 from app.rag.parsers import SUPPORTED_EXTENSIONS
 from app.schemas.document import DocumentList, DocumentOut
 from app.services import document_service as svc
-from app.services.storage import init_s3
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -69,8 +68,8 @@ def upload_document(
 
     # Upload the original file synchronously, then index in the background.
     try:
-        s3 = init_s3(settings)
-        s3.put_object(Bucket=settings.rustfs_bucket, Key=doc.s3_key, Body=data)
+        s3 = get_s3(request)
+        s3.put_object(Bucket=get_bucket(), Key=doc.s3_key, Body=data)
     except Exception as exc:
         doc.status = "failed"
         doc.error = f"upload failed: {exc}"
@@ -94,8 +93,9 @@ def get_document(
 @router.delete("/{document_id}", status_code=204)
 def delete_document(
     document_id: uuid.UUID,
+    request: Request,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> None:
     doc = svc.get_or_404(db, document_id, user.id)
-    svc.delete_document(db, doc, get_settings())
+    svc.delete_document(db, doc, get_s3(request), get_bucket())

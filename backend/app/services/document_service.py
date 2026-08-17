@@ -10,6 +10,8 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from botocore.client import BaseClient
+
 from app.core.config import Settings
 from app.db import session as db_session
 from app.db.models import Chunk, Document, User
@@ -72,7 +74,7 @@ def list_documents(
     return rows, total or 0
 
 
-def delete_document(db: Session, doc: Document, settings: Settings) -> None:
+def delete_document(db: Session, doc: Document, s3: BaseClient, bucket: str) -> None:
     """Delete chunks (DB cascade) + the S3 object + the row.
 
     A document that is still indexing is marked failed first so a racing
@@ -83,8 +85,7 @@ def delete_document(db: Session, doc: Document, settings: Settings) -> None:
         db.commit()
     db.delete(doc)  # chunks cascade via FK
     db.commit()
-    s3 = init_s3(settings)
-    s3.delete_object(Bucket=settings.rustfs_bucket, Key=doc.s3_key)
+    s3.delete_object(Bucket=bucket, Key=doc.s3_key)
     logger.info("document deleted: id=%s s3_key=%s", doc.id, doc.s3_key)
 
 

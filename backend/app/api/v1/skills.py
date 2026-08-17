@@ -10,65 +10,21 @@ from __future__ import annotations
 
 import re
 
-import yaml
-from botocore.client import BaseClient
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 
-from app.core.config import get_settings
-from app.core.deps import get_current_user
+from app.core.deps import get_bucket, get_current_user, get_s3
 from app.db.models import User
 from app.schemas.skill import SkillCreate, SkillList, SkillOut, SkillUpdate
-from app.services.storage import user_skills_prefix
+from app.services.skill_md import build_skill_md, parse_skill_md, skill_key
+from app.services.storage import (
+    is_s3_not_found,
+    list_objects,
+    object_exists,
+    user_skills_prefix,
+)
 
 router = APIRouter(prefix="/skills", tags=["skills"])
-
-
-# ---------------------------------------------------------------------------
-# SKILL.md helpers
-# ---------------------------------------------------------------------------
-
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)", re.DOTALL)
-
-
-def _build_skill_md(name: str, description: str, instructions: str) -> str:
-    """Generate SKILL.md content from components."""
-    frontmatter = yaml.safe_dump(
-        {"name": name, "description": description},
-        allow_unicode=True, default_flow_style=False, sort_keys=False,
-    ).strip()
-    return f"---\n{frontmatter}\n---\n\n{instructions}"
-
-
-def _parse_skill_md(content: str) -> tuple[str, str, str] | None:
-    """Parse SKILL.md → (name, description, instructions). Returns None on bad format."""
-    m = _FRONTMATTER_RE.match(content)
-    if not m:
-        return None
-    try:
-        meta = yaml.safe_load(m.group(1))
-    except yaml.YAMLError:
-        return None
-    if not isinstance(meta, dict):
-        return None
-    name = str(meta.get("name", "")).strip()
-    desc = str(meta.get("description", "")).strip()
-    if not name or not desc:
-        return None
-    return name, desc, m.group(2).strip()
-
-
-def _skill_key(user_id: str, name: str) -> str:
-    """S3 key for a skill's SKILL.md file."""
-    return f"{user_skills_prefix(user_id)}/{name}/SKILL.md"
-
-
-def _get_s3(request: Request) -> BaseClient:
-    return request.app.state.s3
-
-
-def _get_bucket() -> str:
-    return get_settings().rustfs_bucket
 
 
 # ---------------------------------------------------------------------------
@@ -80,33 +36,24 @@ def list_skills(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> SkillList:
-    s3 = _get_s3(request)
-    bucket = _get_bucket()
+    s3 = get_s3(request)
+    bucket = get_bucket()
     prefix = f"{user_skills_prefix(str(user.id))}/"
 
     # List all SKILL.md files under the user's skills prefix.
     skills: list[SkillOut] = []
-    token = None
-    while True:
-        kwargs = {"Bucket": bucket, "Prefix": prefix}
-        if token:
-            kwargs["ContinuationToken"] = token
-        resp = s3.list_objects_v2(**kwargs)
-        for obj in resp.get("Contents", []):
-            if not obj["Key"].endswith("/SKILL.md"):
-                continue
-            try:
-                raw = s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
-                parsed = _parse_skill_md(raw.decode("utf-8"))
-            except Exception:
-                continue
-            if parsed is None:
-                continue
-            name, desc, instr = parsed
-            skills.append(SkillOut(name=name, description=desc, instructions=instr, path=obj["Key"]))
-        if not resp.get("IsTruncated"):
-            break
-        token = resp.get("NextContinuationToken")
+    for obj in list_objects(s3, bucket, prefix):
+        if not obj["Key"].endswith("/SKILL.md"):
+            continue
+        try:
+            raw = s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
+            parsed = parse_skill_md(raw.decode("utf-8"))
+        except Exception:
+            continue
+        if parsed is None:
+            continue
+        name, desc, instr = parsed
+        skills.append(SkillOut(name=name, description=desc, instructions=instr, path=obj["Key"]))
 
     return SkillList(items=skills, total=len(skills))
 
@@ -117,21 +64,14 @@ def create_skill(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> SkillOut:
-    s3 = _get_s3(request)
-    bucket = _get_bucket()
-    key = _skill_key(str(user.id), body.name)
+    s3 = get_s3(request)
+    bucket = get_bucket()
+    key = skill_key(str(user.id), body.name)
 
-    # Check for duplicate.
-    try:
-        s3.head_object(Bucket=bucket, Key=key)
+    if object_exists(s3, bucket, key):
         raise HTTPException(status_code=409, detail=f"技能 '{body.name}' 已存在")
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code not in ("404", "NoSuchKey"):
-            if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") != 404:
-                raise
 
-    content = _build_skill_md(body.name, body.description, body.instructions)
+    content = build_skill_md(body.name, body.description, body.instructions)
     s3.put_object(Bucket=bucket, Key=key, Body=content.encode("utf-8"))
     return SkillOut(
         name=body.name, description=body.description,
@@ -145,16 +85,16 @@ def get_skill(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> SkillOut:
-    s3 = _get_s3(request)
-    bucket = _get_bucket()
-    key = _skill_key(str(user.id), name)
+    s3 = get_s3(request)
+    bucket = get_bucket()
+    key = skill_key(str(user.id), name)
     try:
         raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
     except ClientError as exc:
-        if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404:
+        if is_s3_not_found(exc):
             raise HTTPException(status_code=404, detail="技能不存在")
         raise
-    parsed = _parse_skill_md(raw.decode("utf-8"))
+    parsed = parse_skill_md(raw.decode("utf-8"))
     if parsed is None:
         raise HTTPException(status_code=500, detail="SKILL.md 格式损坏")
     skill_name, desc, instr = parsed
@@ -168,25 +108,25 @@ def update_skill(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> SkillOut:
-    s3 = _get_s3(request)
-    bucket = _get_bucket()
-    key = _skill_key(str(user.id), name)
+    s3 = get_s3(request)
+    bucket = get_bucket()
+    key = skill_key(str(user.id), name)
 
     try:
         raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
     except ClientError as exc:
-        if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404:
+        if is_s3_not_found(exc):
             raise HTTPException(status_code=404, detail="技能不存在")
         raise
 
-    parsed = _parse_skill_md(raw.decode("utf-8"))
+    parsed = parse_skill_md(raw.decode("utf-8"))
     if parsed is None:
         raise HTTPException(status_code=500, detail="SKILL.md 格式损坏")
     _, old_desc, old_instr = parsed
 
     new_desc = body.description if body.description is not None else old_desc
     new_instr = body.instructions if body.instructions is not None else old_instr
-    content = _build_skill_md(name, new_desc, new_instr)
+    content = build_skill_md(name, new_desc, new_instr)
     s3.put_object(Bucket=bucket, Key=key, Body=content.encode("utf-8"))
     return SkillOut(name=name, description=new_desc, instructions=new_instr, path=key)
 
@@ -197,28 +137,15 @@ def delete_skill(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> None:
-    s3 = _get_s3(request)
-    bucket = _get_bucket()
+    s3 = get_s3(request)
+    bucket = get_bucket()
     skill_prefix = f"{user_skills_prefix(str(user.id))}/{name}/"
 
     # Delete all objects under the skill directory.
-    token = None
-    deleted_any = False
-    while True:
-        kwargs = {"Bucket": bucket, "Prefix": skill_prefix}
-        if token:
-            kwargs["ContinuationToken"] = token
-        resp = s3.list_objects_v2(**kwargs)
-        objects = [{"Key": o["Key"]} for o in resp.get("Contents", [])]
-        if objects:
-            s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
-            deleted_any = True
-        if not resp.get("IsTruncated"):
-            break
-        token = resp.get("NextContinuationToken")
-
-    if not deleted_any:
+    keys = [obj["Key"] for obj in list_objects(s3, bucket, skill_prefix)]
+    if not keys:
         raise HTTPException(status_code=404, detail="技能不存在")
+    s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in keys]})
 
 
 @router.post("/import", response_model=SkillOut, status_code=201)
@@ -239,7 +166,7 @@ async def import_skill(
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="文件编码不是 UTF-8")
 
-    parsed = _parse_skill_md(text)
+    parsed = parse_skill_md(text)
 
     if parsed:
         # 标准 SKILL.md 格式
@@ -258,25 +185,17 @@ async def import_skill(
 
     # 校验 name 格式
     if not re.match(r"^[a-z0-9]+(-[a-z0-9]+)*$", name):
-        old_name = name
         name = re.sub(r"[^a-z0-9-]", "", name.lower()).strip("-")
         if not name:
             name = "imported-skill"
 
-    s3 = _get_s3(request)
-    bucket = _get_bucket()
-    key = _skill_key(str(user.id), name)
+    s3 = get_s3(request)
+    bucket = get_bucket()
+    key = skill_key(str(user.id), name)
 
-    # 检查重名
-    try:
-        s3.head_object(Bucket=bucket, Key=key)
+    if object_exists(s3, bucket, key):
         raise HTTPException(status_code=409, detail=f"技能 '{name}' 已存在")
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code not in ("404", "NoSuchKey"):
-            if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") != 404:
-                raise
 
-    content = _build_skill_md(name, desc, instr)
+    content = build_skill_md(name, desc, instr)
     s3.put_object(Bucket=bucket, Key=key, Body=content.encode("utf-8"))
     return SkillOut(name=name, description=desc, instructions=instr, path=key)

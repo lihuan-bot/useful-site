@@ -38,7 +38,7 @@ from dataclasses import dataclass
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
-ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+from app.services.storage import ALLOWED_IMAGE_EXT, safe_relative_path
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +98,9 @@ async def build_multimodal_input(
     for vpath in image_paths:
         if not isinstance(vpath, str) or not vpath.startswith("/files/"):
             continue
-        clean = posixpath.normpath(vpath.lstrip("/"))
-        if clean == ".." or clean.startswith("../"):
+        try:
+            clean = safe_relative_path(vpath)
+        except ValueError:
             continue
         _, ext = posixpath.splitext(clean)
         if ext.lower() not in ALLOWED_IMAGE_EXT:

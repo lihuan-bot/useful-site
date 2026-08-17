@@ -15,7 +15,7 @@ from app.agent.backend_factory import build_backend_sync, kill_backend
 from app.agent.factory import build_agent, get_llm
 from app.agent.runtime import SSEEventMapper, build_multimodal_input, run_agent, stream_agent
 from app.core.config import get_settings
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, get_s3
 from app.db.models import User
 from app.db.session import get_db
 from app.schemas.conversation import ChatRequest, ChatResponse, MessageOut
@@ -40,7 +40,7 @@ async def _prepare_run(request: Request, user: User, conversation_id: uuid.UUID)
     backend = await asyncio.to_thread(
         build_backend_sync,
         settings,
-        s3=request.app.state.s3,
+        s3=get_s3(request),
         user_id=str(user.id),
     )
     try:
@@ -78,7 +78,7 @@ async def send_message(
         body.content,
         body.image_paths,
         user_id=str(user.id),
-        s3_client=request.app.state.s3,
+        s3_client=get_s3(request),
         bucket=settings.rustfs_bucket,
         supports_vision=settings.llm_supports_vision,
     )
@@ -126,7 +126,7 @@ async def stream_chat(
         body.content,
         body.image_paths,
         user_id=str(user.id),
-        s3_client=request.app.state.s3,
+        s3_client=get_s3(request),
         bucket=settings.rustfs_bucket,
         supports_vision=settings.llm_supports_vision,
     )

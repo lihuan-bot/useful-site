@@ -51,3 +51,8 @@ def get_current_user(
 def get_s3(request: Request):
     """boto3 S3 client registered at startup."""
     return request.app.state.s3
+
+
+def get_bucket() -> str:
+    """RustFS bucket name from settings."""
+    return get_settings().rustfs_bucket

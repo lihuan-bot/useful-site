@@ -11,28 +11,24 @@ import posixpath
 import uuid
 from datetime import datetime
 
-from botocore.client import BaseClient
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.core.config import get_settings
-from app.core.deps import get_current_user
+from app.core.deps import get_bucket, get_current_user, get_s3
 from app.db.models import User
-from app.services.storage import user_files_prefix
+from app.services.storage import (
+    ALLOWED_IMAGE_EXT,
+    is_s3_not_found,
+    list_objects,
+    safe_relative_path,
+    user_files_prefix,
+)
 
 router = APIRouter(prefix="/files", tags=["files"])
 
-ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB per file
-
-
-def _get_s3(request: Request) -> BaseClient:
-    return request.app.state.s3
-
-
-def _get_bucket() -> str:
-    return get_settings().rustfs_bucket
 
 
 @router.get("")
@@ -41,30 +37,18 @@ def list_files(
     user: User = Depends(get_current_user),
 ) -> dict:
     """List all files under the user's ``/files/`` area."""
-    s3 = _get_s3(request)
-    bucket = _get_bucket()
+    s3 = get_s3(request)
+    bucket = get_bucket()
     prefix = f"{user_files_prefix(str(user.id))}/"
 
     files: list[dict] = []
-    token = None
-    while True:
-        kwargs = {"Bucket": bucket, "Prefix": prefix}
-        if token:
-            kwargs["ContinuationToken"] = token
-        resp = s3.list_objects_v2(**kwargs)
-        for obj in resp.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith("/"):
-                continue
-            name = key[len(prefix):]
-            files.append({
-                "name": name,
-                "size": obj.get("Size", 0),
-                "last_modified": obj.get("LastModified").isoformat() if obj.get("LastModified") else None,
-            })
-        if not resp.get("IsTruncated"):
-            break
-        token = resp.get("NextContinuationToken")
+    for obj in list_objects(s3, bucket, prefix):
+        name = obj["Key"][len(prefix):]
+        files.append({
+            "name": name,
+            "size": obj.get("Size", 0),
+            "last_modified": obj.get("LastModified").isoformat() if obj.get("LastModified") else None,
+        })
 
     return {"items": files, "total": len(files)}
 
@@ -103,18 +87,19 @@ def upload_file(
     safe_name = f"{uuid.uuid4().hex[:8]}-{orig}"
     vpath = f"/files/{date_dir}/{safe_name}"
 
-    clean = posixpath.normpath(vpath.lstrip("/"))
-    if clean == ".." or clean.startswith("../"):
+    try:
+        clean = safe_relative_path(vpath)
+    except ValueError:
         raise HTTPException(status_code=400, detail="invalid path")
 
-    bucket = _get_bucket()
+    bucket = get_bucket()
     prefix = user_files_prefix(str(user.id))
     key = f"{prefix}/{clean}"
 
     content_type = file.content_type or mimetypes.guess_type(orig)[0]
     extra = {"ContentType": content_type} if content_type else {}
     try:
-        _get_s3(request).put_object(Bucket=bucket, Key=key, Body=data, **extra)
+        get_s3(request).put_object(Bucket=bucket, Key=key, Body=data, **extra)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"保存失败: {exc}")
 
@@ -137,18 +122,19 @@ def download_file(
     user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     """Download a single file from the user's ``/files/`` area."""
-    s3 = _get_s3(request)
-    bucket = _get_bucket()
+    s3 = get_s3(request)
+    bucket = get_bucket()
 
-    clean = posixpath.normpath(file_path.lstrip("/"))
-    if clean == ".." or clean.startswith("../"):
+    try:
+        clean = safe_relative_path(file_path)
+    except ValueError:
         raise HTTPException(status_code=400, detail="invalid path")
     key = f"{user_files_prefix(str(user.id))}/{clean}"
 
     try:
         resp = s3.get_object(Bucket=bucket, Key=key)
     except ClientError as exc:
-        if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404:
+        if is_s3_not_found(exc):
             raise HTTPException(status_code=404, detail="文件不存在")
         raise
 

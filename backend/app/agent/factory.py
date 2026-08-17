@@ -16,6 +16,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.agent.prompts import AGENT_SYSTEM_PROMPT
 from app.core.config import Settings, get_settings
+from app.services.skill_md import parse_skill_md
 
 # deepagents imports are intentionally confined to this layer.
 from deepagents import create_deep_agent
@@ -90,20 +91,20 @@ def _log_skills_diagnostic(backend: BackendProtocol) -> None:
         if resp.content is None:
             logger.warning("skills: %s — downloaded but content is None", resp.path)
             continue
-        # Try to parse frontmatter for a quick name/description check.
+        # Parse via the shared SKILL.md parser (same logic as the skills API).
         try:
             text = resp.content.decode("utf-8")
         except UnicodeDecodeError:
             logger.warning("skills: %s — not valid UTF-8", resp.path)
             continue
-        name = _extract_frontmatter_field(text, "name")
-        desc = _extract_frontmatter_field(text, "description")
-        if not name or not desc:
+        parsed = parse_skill_md(text)
+        if parsed is None:
             logger.warning(
-                "skills: %s — SKILL.md missing 'name' or 'description' in frontmatter "
-                "(got name=%r description=%r)", resp.path, name, desc,
+                "skills: %s — SKILL.md missing 'name' or 'description' in frontmatter",
+                resp.path,
             )
             continue
+        name, desc, _ = parsed
         logger.info(
             "skills: loaded '%s' (%d bytes) from %s — %s",
             name, len(resp.content), resp.path, desc[:80],
@@ -111,22 +112,6 @@ def _log_skills_diagnostic(backend: BackendProtocol) -> None:
         loaded += 1
 
     logger.info("skills: %d/%d SKILL.md file(s) successfully parsed", loaded, len(skill_md_paths))
-
-
-def _extract_frontmatter_field(content: str, field: str) -> str | None:
-    """Quick regex extraction of a YAML frontmatter field (no full YAML parse)."""
-    import re
-
-    m = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
-    if not m:
-        return None
-    fm = m.group(1)
-    for line in fm.splitlines():
-        if ":" in line:
-            key, _, val = line.partition(":")
-            if key.strip() == field:
-                return val.strip().strip("\"'")
-    return None
 
 
 def build_agent(
