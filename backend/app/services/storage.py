@@ -53,3 +53,8 @@ def user_document_key(user_id: str, document_id: str, filename: str) -> str:
 def user_files_prefix(user_id: str) -> str:
     """S3 key prefix for the agent-facing persistent file area."""
     return f"users/{user_id}/files"
+
+
+def user_skills_prefix(user_id: str) -> str:
+    """S3 key prefix for the user's skill library (SKILL.md files)."""
+    return f"users/{user_id}/skills"

@@ -43,12 +43,20 @@ MAX_GREP_BYTES_PER_FILE = 256 * 1024  # cap bytes scanned per file
 
 
 class RustFSBackend(BackendProtocol):
-    """Per-request backend bound to one user's object prefix."""
+    """Per-request backend bound to one user's object prefix.
 
-    def __init__(self, s3: BaseClient, bucket: str, user_id: str) -> None:
+    By default the root is ``users/{user_id}/files`` (the agent-facing
+    persistent file area).  Pass ``root`` to mount a different prefix —
+    used for the ``/skills/`` route where skills are stored as
+    ``SKILL.md`` files.
+    """
+
+    def __init__(
+        self, s3: BaseClient, bucket: str, user_id: str, *, root: str | None = None
+    ) -> None:
         self._s3 = s3
         self._bucket = bucket
-        self._root = f"users/{user_id}/files"
+        self._root = root or f"users/{user_id}/files"
 
     # ------------------------------------------------------------------
     # Path mapping

@@ -49,7 +49,12 @@ def build_agent(
     checkpointer: BaseCheckpointSaver,
     tools: list | None = None,
 ):
-    """Build the per-request compiled deep agent graph."""
+    """Build the per-request compiled deep agent graph.
+
+    ``skills=["/skills/"]`` enables the native ``SkillsMiddleware`` which
+    loads ``SKILL.md`` files from the ``/skills/`` RustFS route and injects
+    their metadata into the system prompt via progressive disclosure.
+    """
     middleware = [TodoListMiddleware()] if settings.agent_todos_enabled else None
     agent = create_deep_agent(
         model=llm,
@@ -58,9 +63,10 @@ def build_agent(
         checkpointer=checkpointer,
         system_prompt=AGENT_SYSTEM_PROMPT,
         middleware=middleware,
+        skills=["/skills/"],
     )
     logger.debug(
-        "agent graph built: model=%s tools=%d todos=%s",
+        "agent graph built: model=%s tools=%d todos=%s skills=enabled",
         settings.llm_model, len(tools or []), bool(middleware),
     )
     return agent

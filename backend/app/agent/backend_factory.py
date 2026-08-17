@@ -40,7 +40,14 @@ def build_backend_sync(
         (time.perf_counter() - started) * 1000,
     )
     rustfs = RustFSBackend(s3=s3, bucket=settings.rustfs_bucket, user_id=user_id)
-    return CompositeBackend(default=sandbox, routes={"/files/": rustfs})
+    rustfs_skills = RustFSBackend(
+        s3=s3, bucket=settings.rustfs_bucket, user_id=user_id,
+        root=f"users/{user_id}/skills",
+    )
+    return CompositeBackend(
+        default=sandbox,
+        routes={"/files/": rustfs, "/skills/": rustfs_skills},
+    )
 
 
 async def kill_backend(backend: BackendProtocol | None) -> None:
