@@ -52,6 +52,53 @@ def _build_limiter(settings: Settings):
     return UserLimiter(settings.max_concurrent_agents_per_user)
 
 
+def _cleanup_orphan_sandboxes(settings: Settings) -> None:
+    """Destroy all sandboxes on the OpenSandbox server before starting the pool.
+
+    Previous processes (crashed or killed by --reload) leave orphaned sandboxes
+    that the new pool cannot track. This sweeps them so only the fresh pool's
+    sandboxes remain.
+    """
+    import json
+    import urllib.request
+
+    base = settings.opensandbox_domain.rstrip("/")
+    headers = {"OPEN-SANDBOX-API-KEY": settings.opensandbox_api_key}
+
+    try:
+        req = urllib.request.Request(
+            f"{base}/sandboxes?page=1&pageSize=200",
+            headers=headers,
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        items = data.get("items", data.get("sandboxes", [])) if isinstance(data, dict) else data
+    except Exception:
+        logger.warning("orphan cleanup: failed to list sandboxes, skipping")
+        return
+
+    if not items:
+        logger.info("orphan cleanup: no sandboxes to clean")
+        return
+
+    destroyed = 0
+    for s in items:
+        sid = s.get("id", "")
+        if not sid:
+            continue
+        try:
+            req = urllib.request.Request(
+                f"{base}/sandboxes/{sid}",
+                method="DELETE",
+                headers=headers,
+            )
+            urllib.request.urlopen(req, timeout=10)
+            destroyed += 1
+        except Exception:
+            pass
+    logger.info("orphan cleanup: destroyed %d/%d sandbox(es)", destroyed, len(items))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -100,6 +147,12 @@ async def lifespan(app: FastAPI):
 
     from sandbox.pool import PreheatedSyncOpenSandboxBackend
 
+    # Clean up orphaned sandboxes from previous (crashed) processes before
+    # starting the pool — otherwise they accumulate across reloads.
+    await asyncio.to_thread(
+        _cleanup_orphan_sandboxes, settings
+    )
+
     await asyncio.to_thread(
         PreheatedSyncOpenSandboxBackend.start_pool,
         domain=settings.opensandbox_domain,
@@ -124,8 +177,11 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown: clean up in reverse order.
+    # graceful=False: force-destroy idle sandboxes immediately.
+    # In --reload mode uvicorn gives only ~5s before SIGKILL; waiting for
+    # in-flight ops would leave orphan sandboxes on the server.
     if app.state.shutdown_pool is not None:
-        await asyncio.to_thread(app.state.shutdown_pool)
+        await asyncio.to_thread(app.state.shutdown_pool, graceful=False)
     if app.state.checkpointer is not None:
         await app.state.checkpointer.aclose()
     if db_session.engine is not None:

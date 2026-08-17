@@ -13,7 +13,7 @@ import re
 import yaml
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user
@@ -219,3 +219,64 @@ def delete_skill(
 
     if not deleted_any:
         raise HTTPException(status_code=404, detail="技能不存在")
+
+
+@router.post("/import", response_model=SkillOut, status_code=201)
+async def import_skill(
+    request: Request,
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+) -> SkillOut:
+    """从上传的文件导入技能。
+
+    支持两种格式：
+    1. 标准 SKILL.md（含 YAML frontmatter）→ 直接解析保存
+    2. 普通 Markdown → 用文件名（去扩展名）作为 name，首段作为 description
+    """
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="文件编码不是 UTF-8")
+
+    parsed = _parse_skill_md(text)
+
+    if parsed:
+        # 标准 SKILL.md 格式
+        name, desc, instr = parsed
+    else:
+        # 普通 Markdown：从文件名推导 name，首段作为 description
+        filename = file.filename or "imported-skill"
+        name = re.sub(r"[^a-z0-9-]", "", filename.rsplit(".", 1)[0].lower()).strip("-")
+        if not name:
+            name = "imported-skill"
+        # 首个非空段落作为 description
+        lines = text.strip().splitlines()
+        first_para = next((l for l in lines if l.strip().lstrip("#").strip()), "Imported skill")
+        desc = first_para.strip().lstrip("#").strip()[:200]
+        instr = text
+
+    # 校验 name 格式
+    if not re.match(r"^[a-z0-9]+(-[a-z0-9]+)*$", name):
+        old_name = name
+        name = re.sub(r"[^a-z0-9-]", "", name.lower()).strip("-")
+        if not name:
+            name = "imported-skill"
+
+    s3 = _get_s3(request)
+    bucket = _get_bucket()
+    key = _skill_key(str(user.id), name)
+
+    # 检查重名
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        raise HTTPException(status_code=409, detail=f"技能 '{name}' 已存在")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("404", "NoSuchKey"):
+            if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") != 404:
+                raise
+
+    content = _build_skill_md(name, desc, instr)
+    s3.put_object(Bucket=bucket, Key=key, Body=content.encode("utf-8"))
+    return SkillOut(name=name, description=desc, instructions=instr, path=key)

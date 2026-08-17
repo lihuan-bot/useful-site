@@ -122,7 +122,11 @@ async def stream_chat(
         limiter.release(user_key)
         raise
     config = {"configurable": {"thread_id": thread_id}}
-    mapper = SSEEventMapper(conversation_id=str(conv.id), thread_id=thread_id)
+    mapper = SSEEventMapper(
+        conversation_id=str(conv.id),
+        thread_id=thread_id,
+        base_url=str(request.base_url),
+    )
 
     async def gen():
         started = time.perf_counter()

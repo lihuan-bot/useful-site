@@ -88,44 +88,51 @@ class SSEEventMapper:
     answer is surfaced to the parent as the ``task`` tool's ToolMessage.
     """
 
-    def __init__(self, conversation_id: str, thread_id: str) -> None:
+    def __init__(self, conversation_id: str, thread_id: str, base_url: str = "") -> None:
         self.conversation_id = conversation_id
         self.thread_id = thread_id
+        self.base_url = base_url.rstrip("/")
         self.assistant_text_parts: list[str] = []
         self._emitted_tool_calls: set[str] = set()
         self._emitted_tool_results: set[str] = set()
+        self._emitted_artifacts: set[str] = set()
         self.message_id = str(uuid.uuid4())
 
     # -- feeds ---------------------------------------------------------
 
-    def feed_text(self, text: str) -> str | None:
+    def feed_text(self, text: str) -> list[str | None]:
         if not text:
-            return None
+            return [None]
         self.assistant_text_parts.append(text)
-        return sse("message", {"message_id": self.message_id, "delta": text})
+        return [sse("message", {"message_id": self.message_id, "delta": text})]
 
-    def feed_tool_call(self, ts) -> str | None:
+    def feed_tool_call(self, ts) -> list[str | None]:
         """``ToolCallStream`` at tool start — complete input args."""
         call_id = ts.tool_call_id or ""
         if call_id and call_id in self._emitted_tool_calls:
-            return None
+            return [None]
         if call_id:
             self._emitted_tool_calls.add(call_id)
         logger.info("tool_call: id=%s name=%s args=%s", call_id, ts.tool_name, ts.input)
-        return sse(
+        return [sse(
             "tool_call",
             {
                 "tool_call_id": call_id,
                 "name": ts.tool_name or "unknown",
                 "arguments": ts.input or {},
             },
-        )
+        )]
 
-    def feed_tool_result(self, ts) -> str | None:
-        """``ToolCallStream`` after its delta channel closed (success path)."""
+    def feed_tool_result(self, ts) -> list[str | None]:
+        """``ToolCallStream`` after its delta channel closed (success path).
+
+        Returns a list of SSE event strings (may contain 0 or 2 items:
+        the tool_result event and optionally an artifact event when
+        ``write_file`` saved something under ``/files/``).
+        """
         call_id = ts.tool_call_id or ""
         if call_id and call_id in self._emitted_tool_results:
-            return None
+            return [None]
         if call_id:
             self._emitted_tool_results.add(call_id)
         output = ts.output
@@ -136,27 +143,65 @@ class SSEEventMapper:
             content = str(output)
             is_error = False
         logger.info(
-            "tool_result: id=%s error=%s output_len=%d",
-            call_id, is_error, len(content),
+            "tool_result: id=%s name=%s error=%s output_len=%d",
+            call_id, ts.tool_name, is_error, len(content),
         )
-        return sse(
+        result = sse(
             "tool_result",
             {"tool_call_id": call_id, "output": content[:4000], "is_error": is_error},
         )
+        events: list[str | None] = [result]
 
-    def feed_tool_error(self, ts) -> str | None:
+        # Detect write_file to /files/ — emit artifact event for download.
+        if not is_error and ts.tool_name == "write_file":
+            file_path = self._extract_file_path(ts.input)
+            if file_path and file_path.startswith("/files/"):
+                artifact = self._make_artifact_event(file_path)
+                if artifact:
+                    events.append(artifact)
+
+        return events
+
+    def feed_tool_error(self, ts) -> list[str | None]:
         call_id = ts.tool_call_id or ""
         if call_id and call_id in self._emitted_tool_results:
-            return None
+            return [None]
         if call_id:
             self._emitted_tool_results.add(call_id)
         logger.warning("tool_error: id=%s name=%s error=%s", call_id, ts.tool_name, ts.error)
-        return sse(
+        return [sse(
             "tool_result",
             {
                 "tool_call_id": call_id,
                 "output": f"Tool {ts.tool_name} raised: {ts.error}"[:4000],
                 "is_error": True,
+            },
+        )]
+
+    @staticmethod
+    def _extract_file_path(tool_input: dict | None) -> str | None:
+        """Pull ``file_path`` from a tool's input args (best-effort)."""
+        if not isinstance(tool_input, dict):
+            return None
+        fp = tool_input.get("file_path") or tool_input.get("path")
+        if isinstance(fp, str):
+            return fp
+        return None
+
+    def _make_artifact_event(self, file_path: str) -> str | None:
+        """Build an ``artifact`` SSE event for a file under ``/files/``."""
+        # Dedup: one artifact per file path.
+        if file_path in self._emitted_artifacts:
+            return None
+        self._emitted_artifacts.add(file_path)
+        filename = file_path[len("/files/"):]  # strip /files/ prefix
+        download_url = f"{self.base_url}/api/v1/files/{filename}" if self.base_url else f"/api/v1/files/{filename}"
+        return sse(
+            "artifact",
+            {
+                "name": filename,
+                "download_url": download_url,
+                "tool_call_id": "",  # filled by caller when available
             },
         )
 
@@ -246,17 +291,18 @@ async def stream_agent(
                     continue
                 kind, payload = item
                 if kind == "text":
-                    out = mapper.feed_text(payload)
+                    outs = mapper.feed_text(payload)
                 elif kind == "tool_call":
-                    out = mapper.feed_tool_call(payload)
+                    outs = mapper.feed_tool_call(payload)
                 elif kind == "tool_result":
-                    out = mapper.feed_tool_result(payload)
+                    outs = mapper.feed_tool_result(payload)
                 elif kind == "tool_error":
-                    out = mapper.feed_tool_error(payload)
+                    outs = mapper.feed_tool_error(payload)
                 else:  # pragma: no cover — queue protocol is closed
-                    out = None
-                if out:
-                    yield out
+                    outs = [None]
+                for out in outs:
+                    if out:
+                        yield out
             # Both pumps exhausted: reap them (propagates pump exceptions).
             await asyncio.gather(*pumps)
             yield mapper.done_event()

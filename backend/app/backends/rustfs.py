@@ -25,6 +25,7 @@ from deepagents.backends.protocol import (
     EditResult,
     FILE_NOT_FOUND,
     FileData,
+    FileDownloadResponse,
     FileInfo,
     GlobResult,
     GrepMatch,
@@ -247,6 +248,34 @@ class RustFSBackend(BackendProtocol):
         except Exception as exc:
             return DeleteResult(error=str(exc))
         return DeleteResult(path=file_path)
+
+    # ------------------------------------------------------------------
+    # Batch download (used by SkillsMiddleware)
+    # ------------------------------------------------------------------
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        """Batch download files — required by ``SkillsMiddleware`` to load SKILL.md files.
+
+        Uses S3 ``get_object`` directly (returns raw bytes, no text decoding).
+        """
+        results: list[FileDownloadResponse] = []
+        for path in paths:
+            try:
+                key = self._to_key(path)
+            except ValueError:
+                results.append(FileDownloadResponse(path=path, error=INVALID_PATH))
+                continue
+            try:
+                raw = self._s3.get_object(Bucket=self._bucket, Key=key)["Body"].read()
+                results.append(FileDownloadResponse(path=path, content=raw))
+            except ClientError as exc:
+                if self._is_s3_error(exc, "NoSuchKey"):
+                    results.append(FileDownloadResponse(path=path, error=FILE_NOT_FOUND))
+                else:
+                    results.append(FileDownloadResponse(path=path, error=str(exc)))
+            except Exception as exc:
+                results.append(FileDownloadResponse(path=path, error=str(exc)))
+        return results
 
     # ------------------------------------------------------------------
     # Search

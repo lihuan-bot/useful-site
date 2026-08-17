@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     agent_todos_enabled: bool = False  # TodoListMiddleware is opt-in in 0.7.x
     max_concurrent_agents_per_user: int = 1
 
+    # --- Zhipu Web Search ---
+    zhipu_api_key: str = ""
+
     # --- RAG ---
     rag_chunk_size: int = 800
     rag_chunk_overlap: int = 120
