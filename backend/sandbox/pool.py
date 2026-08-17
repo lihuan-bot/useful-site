@@ -187,6 +187,15 @@ class PreheatedSyncOpenSandboxBackend(BaseSandbox):
         """
         if cls._pool is None:
             return
+        # pool.shutdown() does NOT destroy idle sandboxes on the server — only
+        # stops the reconcile loop and closes the HTTP client. Destroy them
+        # explicitly first, otherwise they leak until the server TTL reaps them.
+        try:
+            released = cls._pool.release_all_idle()
+            if released:
+                logger.info("Destroyed %d idle sandbox(es).", released)
+        except Exception:
+            logger.exception("Failed to destroy idle sandboxes on shutdown")
         cls._pool.shutdown(graceful=graceful)
         cls._pool = None
         cls._pool_config = None
