@@ -2,7 +2,7 @@
 Author: lihuan
 Date: 2026-08-16 22:34:32
 LastEditors: lihuan
-LastEditTime: 2026-08-17 12:53:27
+LastEditTime: 2026-08-17 13:16:13
 Email: 17719495105@163.com
 '''
 """Per-user concurrency limiter (in-memory, single-process).
@@ -16,7 +16,6 @@ counters. Enforce at the process level by running one worker, or move to
 ``pg_try_advisory_lock(hashtext(user_id))`` for cross-worker strictness.
 """
 
-from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict

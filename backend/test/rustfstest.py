@@ -30,7 +30,7 @@ import boto3
 from botocore.client import Config
 
 # ---------------- 连接配置 ----------------
-ENDPOINT = "http://124.221.180.74:9000"  # S3 API 端口是 9000 (9001 是控制台端口)
+ENDPOINT = "http://127.0.0.1:9000"  # S3 API 端口是 9000
 ACCESS_KEY = "123456"
 SECRET_KEY = "123456"
 REGION = "us-east-1"  # RustFS 默认区域

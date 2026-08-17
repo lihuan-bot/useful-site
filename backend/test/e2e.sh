@@ -97,7 +97,7 @@ echo "== 9) RustFS objects =="
 uv run python - <<PY
 import boto3
 from botocore.client import Config
-s3 = boto3.client("s3", endpoint_url="http://124.221.180.74:9000",
+s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:9000",
   aws_access_key_id="123456", aws_secret_access_key="123456", region_name="us-east-1",
   config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
 keys = [o["Key"] for o in s3.list_objects_v2(Bucket="agent-files").get("Contents", [])]

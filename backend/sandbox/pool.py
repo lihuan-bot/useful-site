@@ -20,7 +20,7 @@ Usage
 
     # One-time setup (at process start)
     PreheatedSyncOpenSandboxBackend.start_pool(
-        domain="http://124.221.180.74:10000",
+        domain="http://127.0.0.1:10000",
         api_key="123456",
         image="...",
         max_idle=3,  # keep 3 sandboxes ready

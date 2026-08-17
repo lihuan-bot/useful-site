@@ -2,7 +2,7 @@
 Author: lihuan
 Date: 2026-08-13 20:12:38
 LastEditors: lihuan
-LastEditTime: 2026-08-14 00:36:43
+LastEditTime: 2026-08-17 13:00:12
 Email: 17719495105@163.com
 '''
 """测试连接远程 PostgreSQL 数据库。"""
@@ -10,8 +10,8 @@ import psycopg
 
 # 连接信息
 CONN_INFO = {
-    "host": "127.0.0.1",  # 隧道 ssh -L 5432:127.0.0.1:5432 root@124.221.180.74
-    "port": 5432,                     #本地端口  远端地址和端口
+    "host": "127.0.0.1",  
+    "port": 5432,               
     "user": "admin",
     "password": "123456",
     "dbname": "default_db",
