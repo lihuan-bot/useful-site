@@ -122,20 +122,29 @@ async def build_multimodal_input(
         return content + appendix
 
     blocks: list = [{"type": "text", "text": content}]
-    for vpath, clean in valid_paths:
+
+    # Fetch all images concurrently — each get_object is an independent
+    # network round-trip to RustFS; asyncio.to_thread keeps the blocking
+    # boto3 call off the event loop while letting them run in parallel.
+    async def _fetch_image(vpath: str, clean: str) -> dict | None:
         key = f"users/{user_id}/{clean}"
         try:
-            obj = s3_client.get_object(Bucket=bucket, Key=key)
-            raw = obj["Body"].read()
+            obj = await asyncio.to_thread(s3_client.get_object, Bucket=bucket, Key=key)
+            raw = await asyncio.to_thread(obj["Body"].read)
             ctype = obj.get("ContentType") or mimetypes.guess_type(clean)[0] or "image/png"
         except Exception as exc:
             logger.warning("multimodal: failed to read %s: %s", vpath, exc)
-            continue
+            return None
         b64 = base64.b64encode(raw).decode("ascii")
-        blocks.append({
+        return {
             "type": "image_url",
             "image_url": {"url": f"data:{ctype};base64,{b64}"},
-        })
+        }
+
+    fetched = await asyncio.gather(*(_fetch_image(v, c) for v, c in valid_paths))
+    for block in fetched:
+        if block is not None:
+            blocks.append(block)
     return blocks if len(blocks) > 1 else content
 
 

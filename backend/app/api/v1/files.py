@@ -85,7 +85,7 @@ def upload_file(
     # Sanitize: date + short uuid prefix to avoid collisions.
     date_dir = datetime.now().strftime("%Y%m%d")
     safe_name = f"{uuid.uuid4().hex[:8]}-{orig}"
-    vpath = f"/files/{date_dir}/{safe_name}"
+    vpath = f"/{date_dir}/{safe_name}"
 
     try:
         clean = safe_relative_path(vpath)

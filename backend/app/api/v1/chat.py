@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.agent.backend_factory import build_backend_sync, kill_backend
+from app.agent.backend_factory import build_backend_sync, kill_sandbox
 from app.agent.factory import build_agent, get_llm
 from app.agent.runtime import SSEEventMapper, build_multimodal_input, run_agent, stream_agent
 from app.core.config import get_settings
@@ -37,7 +37,7 @@ async def _prepare_run(request: Request, user: User, conversation_id: uuid.UUID)
     if not settings.llm_api_key:
         raise HTTPException(status_code=503, detail="LLM not configured")
 
-    backend = await asyncio.to_thread(
+    backend, sandbox = await asyncio.to_thread(
         build_backend_sync,
         settings,
         s3=get_s3(request),
@@ -52,10 +52,10 @@ async def _prepare_run(request: Request, user: User, conversation_id: uuid.UUID)
             tools=build_tools(user, request.app.state.rag_service),
         )
     except Exception:
-        await kill_backend(backend)
+        await kill_sandbox(sandbox)
         raise
     thread_id = svc.thread_id_for(user.id, conversation_id)
-    return agent, backend, thread_id
+    return agent, sandbox, thread_id
 
 
 @router.post("/conversations/{conversation_id}/messages", response_model=ChatResponse)
@@ -83,7 +83,7 @@ async def send_message(
         supports_vision=settings.llm_supports_vision,
     )
 
-    agent, backend, thread_id = await _prepare_run(request, user, conv.id)
+    agent, sandbox, thread_id = await _prepare_run(request, user, conv.id)
     config = {"configurable": {"thread_id": thread_id}}
     started = time.perf_counter()
     logger.info(
@@ -93,7 +93,7 @@ async def send_message(
     try:
         result = await run_agent(agent, content=user_content, config=config)
     finally:
-        await kill_backend(backend)
+        await kill_sandbox(sandbox)
     logger.info(
         "agent run done: thread=%s elapsed=%.0fms reply_len=%d",
         thread_id, (time.perf_counter() - started) * 1000, len(result.text),
@@ -137,7 +137,7 @@ async def stream_chat(
         svc.maybe_set_title(db, conv, body.content)
         svc.touch_conversation(db, conv.id)
 
-        agent, backend, thread_id = await _prepare_run(request, user, conv.id)
+        agent, sandbox, thread_id = await _prepare_run(request, user, conv.id)
     except Exception:
         limiter.release(user_key)
         raise
@@ -176,7 +176,7 @@ async def stream_chat(
             yield mapper.error_event("agent_error", str(exc)[:300])
         finally:
             request.app.state.active_streams.pop(str(conv.id), None)
-            await kill_backend(backend)
+            await kill_sandbox(sandbox)
             limiter.release(user_key)
             logger.info(
                 "agent stream end: thread=%s elapsed=%.0fms complete=%s reply_len=%d",

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import timedelta
+from typing import Tuple
 
 from botocore.client import BaseClient
 
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 def build_backend_sync(
     settings: Settings, *, s3: BaseClient, user_id: str
-) -> CompositeBackend:
+) -> Tuple[CompositeBackend, PreheatedSyncOpenSandboxBackend]:
     """Acquire a warm sandbox and compose the routed backend."""
     started = time.perf_counter()
     sandbox = PreheatedSyncOpenSandboxBackend.create(
@@ -44,20 +45,21 @@ def build_backend_sync(
         s3=s3, bucket=settings.rustfs_bucket, user_id=user_id,
         root=f"users/{user_id}/skills",
     )
-    return CompositeBackend(
+    composite = CompositeBackend(
         default=sandbox,
         routes={"/files/": rustfs, "/skills/": rustfs_skills},
     )
+    return composite, sandbox
 
 
-async def kill_backend(backend: BackendProtocol | None) -> None:
+async def kill_sandbox(sandbox: PreheatedSyncOpenSandboxBackend | None) -> None:
     """Release the request's sandbox back to the pool (idempotent)."""
-    if backend is None:
+    if sandbox is not None:
         return
-    kill = getattr(backend, "akill", None)
-    if kill is not None:
+    kill = getattr(sandbox, "akill", None)
+    if kill is None:
         started = time.perf_counter()
-        sandbox_id = getattr(backend.default, "id", "?")
+        sandbox_id = getattr(sandbox, "id", "?")
         await kill()
         logger.info(
             "sandbox destroyed: id=%s elapsed=%.0fms",

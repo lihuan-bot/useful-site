@@ -15,9 +15,8 @@ from botocore.client import BaseClient
 from app.core.config import Settings
 from app.db import session as db_session
 from app.db.models import Chunk, Document, User
-from app.rag.embeddings import EmbeddingsClient
 from app.rag.service import RAGService
-from app.services.storage import init_s3, user_document_key
+from app.services.storage import user_document_key
 
 logger = logging.getLogger(__name__)
 
@@ -89,10 +88,18 @@ def delete_document(db: Session, doc: Document, s3: BaseClient, bucket: str) -> 
     logger.info("document deleted: id=%s s3_key=%s", doc.id, doc.s3_key)
 
 
-def run_indexing(doc_id: uuid.UUID, settings: Settings) -> None:
+def run_indexing(
+    doc_id: uuid.UUID,
+    settings: Settings,
+    *,
+    s3: BaseClient,
+    rag: RAGService,
+) -> None:
     """Background task: parse → chunk → embed → store chunks.
 
-    Opens its own session/embedding client (runs in a threadpool thread).
+    Runs in a threadpool thread; opens its own DB session but reuses the
+    process-wide S3 client and RAGService singletons (created at lifespan
+    startup) instead of rebuilding them per task.
     """
     assert db_session.SessionLocal is not None, "init_engine() must be called at startup"
     started = time.perf_counter()
@@ -104,8 +111,6 @@ def run_indexing(doc_id: uuid.UUID, settings: Settings) -> None:
         doc.status = "processing"
         db.commit()
         try:
-            rag = RAGService(settings, EmbeddingsClient(settings))
-            s3 = init_s3(settings)
             rag.index_document(db=db, s3=s3, doc=doc)
             doc.chunk_count = db.scalar(
                 select(func.count())

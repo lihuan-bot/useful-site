@@ -77,7 +77,16 @@ def upload_document(
         db.refresh(doc)
         return doc
 
-    background.add_task(svc.run_indexing, doc.id, settings)
+    # Reuse the lifespan-singleton S3 client + RAGService instead of letting
+    # the background task rebuild them per upload (each rebuild also poked
+    # RustFS with a HEAD bucket request — pure waste).
+    background.add_task(
+        svc.run_indexing,
+        doc.id,
+        settings,
+        s3=s3,
+        rag=request.app.state.rag_service,
+    )
     return doc
 
 

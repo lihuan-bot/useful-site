@@ -9,6 +9,7 @@ injects their metadata into the system prompt via progressive disclosure.
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -26,6 +27,11 @@ from app.services.storage import (
 
 router = APIRouter(prefix="/skills", tags=["skills"])
 
+# Max parallel GET requests when loading SKILL.md files in list_skills.
+# boto3 clients are thread-safe for separate calls; 8 is a sane ceiling that
+# avoids hammering RustFS while still cutting latency from N×RTT to ~1×RTT.
+_SKILL_FETCH_WORKERS = 8
+
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -40,20 +46,38 @@ def list_skills(
     bucket = get_bucket()
     prefix = f"{user_skills_prefix(str(user.id))}/"
 
-    # List all SKILL.md files under the user's skills prefix.
+    # Collect SKILL.md keys first (single LIST, paginated by list_objects).
+    skill_keys = [
+        obj["Key"]
+        for obj in list_objects(s3, bucket, prefix)
+        if obj["Key"].endswith("/SKILL.md")
+    ]
+
+    # Fetch all SKILL.md bodies in parallel — each get_object is an independent
+    # network round-trip to RustFS, so concurrency turns N×RTT into ~1×RTT.
     skills: list[SkillOut] = []
-    for obj in list_objects(s3, bucket, prefix):
-        if not obj["Key"].endswith("/SKILL.md"):
-            continue
+    if not skill_keys:
+        return SkillList(items=skills, total=0)
+
+    def _fetch(key: str) -> tuple[str, str | None]:
         try:
-            raw = s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
-            parsed = parse_skill_md(raw.decode("utf-8"))
+            raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            return key, raw.decode("utf-8")
         except Exception:
-            continue
-        if parsed is None:
-            continue
-        name, desc, instr = parsed
-        skills.append(SkillOut(name=name, description=desc, instructions=instr, path=obj["Key"]))
+            return key, None
+
+    workers = min(_SKILL_FETCH_WORKERS, len(skill_keys))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for key, text in ex.map(_fetch, skill_keys):
+            if text is None:
+                continue
+            parsed = parse_skill_md(text)
+            if parsed is None:
+                continue
+            name, desc, instr = parsed
+            skills.append(
+                SkillOut(name=name, description=desc, instructions=instr, path=key)
+            )
 
     return SkillList(items=skills, total=len(skills))
 
