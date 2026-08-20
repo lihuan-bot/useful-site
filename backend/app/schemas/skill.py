@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -22,6 +24,11 @@ class SkillOut(BaseModel):
     description: str
     instructions: str
     path: str
+    # "broken" = SkillsMiddleware would skip this file (load_error explains
+    # why).  List includes broken skills so failures are visible to users
+    # instead of silently vanishing from the agent's system prompt.
+    status: Literal["ok", "broken"] = "ok"
+    load_error: str | None = None
 
 
 class SkillList(BaseModel):

@@ -98,16 +98,15 @@ def _log_skills_diagnostic(backend: BackendProtocol) -> None:
             logger.warning("skills: %s — not valid UTF-8", resp.path)
             continue
         parsed = parse_skill_md(text)
-        if parsed is None:
+        if not parsed.ok:
             logger.warning(
-                "skills: %s — SKILL.md missing 'name' or 'description' in frontmatter",
-                resp.path,
+                "skills: %s — will be skipped by SkillsMiddleware: %s",
+                resp.path, parsed.error,
             )
             continue
-        name, desc, _ = parsed
         logger.info(
             "skills: loaded '%s' (%d bytes) from %s — %s",
-            name, len(resp.content), resp.path, desc[:80],
+            parsed.name, len(resp.content), resp.path, parsed.description[:80],
         )
         loaded += 1
 

@@ -17,7 +17,13 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from app.core.deps import get_bucket, get_current_user, get_s3
 from app.db.models import User
 from app.schemas.skill import SkillCreate, SkillList, SkillOut, SkillUpdate
-from app.services.skill_md import build_skill_md, parse_skill_md, skill_key
+from app.services.skill_md import (
+    ERROR_TOO_LARGE,
+    MAX_SKILL_FILE_SIZE,
+    build_skill_md,
+    parse_skill_md,
+    skill_key,
+)
 from app.services.storage import (
     is_s3_not_found,
     list_objects,
@@ -31,6 +37,46 @@ router = APIRouter(prefix="/skills", tags=["skills"])
 # boto3 clients are thread-safe for separate calls; 8 is a sane ceiling that
 # avoids hammering RustFS while still cutting latency from N×RTT to ~1×RTT.
 _SKILL_FETCH_WORKERS = 8
+
+
+def _check_size(content: str) -> None:
+    """Refuse to store a SKILL.md the middleware would refuse to load."""
+    if len(content) > MAX_SKILL_FILE_SIZE:
+        raise HTTPException(status_code=400, detail=ERROR_TOO_LARGE)
+
+
+def _skill_dir_name(key: str) -> str:
+    """Directory name of a SKILL.md key (``.../skills/foo/SKILL.md`` → ``foo``)."""
+    return key.split("/")[-2]
+
+
+def _broken_skill(key: str, load_error: str | None) -> SkillOut:
+    """SkillOut for a SKILL.md that SkillsMiddleware would skip.
+
+    Broken skills stay visible in list responses (with the reason) instead
+    of silently vanishing from the agent's system prompt.
+    """
+    return SkillOut(
+        name=_skill_dir_name(key),
+        description="",
+        instructions="",
+        path=key,
+        status="broken",
+        load_error=load_error,
+    )
+
+
+def _skill_out_for(key: str, text: str | None) -> SkillOut:
+    """Map one (key, body) pair to a SkillOut — ok or broken, never dropped."""
+    if text is None:
+        return _broken_skill(key, "无法读取 SKILL.md 文件")
+    parsed = parse_skill_md(text)
+    if not parsed.ok:
+        return _broken_skill(key, parsed.error)
+    return SkillOut(
+        name=parsed.name, description=parsed.description,
+        instructions=parsed.instructions, path=key,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -69,15 +115,7 @@ def list_skills(
     workers = min(_SKILL_FETCH_WORKERS, len(skill_keys))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for key, text in ex.map(_fetch, skill_keys):
-            if text is None:
-                continue
-            parsed = parse_skill_md(text)
-            if parsed is None:
-                continue
-            name, desc, instr = parsed
-            skills.append(
-                SkillOut(name=name, description=desc, instructions=instr, path=key)
-            )
+            skills.append(_skill_out_for(key, text))
 
     return SkillList(items=skills, total=len(skills))
 
@@ -96,6 +134,7 @@ def create_skill(
         raise HTTPException(status_code=409, detail=f"技能 '{body.name}' 已存在")
 
     content = build_skill_md(body.name, body.description, body.instructions)
+    _check_size(content)
     s3.put_object(Bucket=bucket, Key=key, Body=content.encode("utf-8"))
     return SkillOut(
         name=body.name, description=body.description,
@@ -118,11 +157,11 @@ def get_skill(
         if is_s3_not_found(exc):
             raise HTTPException(status_code=404, detail="技能不存在")
         raise
-    parsed = parse_skill_md(raw.decode("utf-8"))
-    if parsed is None:
-        raise HTTPException(status_code=500, detail="SKILL.md 格式损坏")
-    skill_name, desc, instr = parsed
-    return SkillOut(name=skill_name, description=desc, instructions=instr, path=key)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return _broken_skill(key, "文件不是 UTF-8 编码")
+    return _skill_out_for(key, text)
 
 
 @router.put("/{name}", response_model=SkillOut)
@@ -144,13 +183,14 @@ def update_skill(
         raise
 
     parsed = parse_skill_md(raw.decode("utf-8"))
-    if parsed is None:
-        raise HTTPException(status_code=500, detail="SKILL.md 格式损坏")
-    _, old_desc, old_instr = parsed
+    if not parsed.ok:
+        raise HTTPException(status_code=500, detail=parsed.error or "SKILL.md 格式损坏")
+    old_desc, old_instr = parsed.description, parsed.instructions
 
     new_desc = body.description if body.description is not None else old_desc
     new_instr = body.instructions if body.instructions is not None else old_instr
     content = build_skill_md(name, new_desc, new_instr)
+    _check_size(content)
     s3.put_object(Bucket=bucket, Key=key, Body=content.encode("utf-8"))
     return SkillOut(name=name, description=new_desc, instructions=new_instr, path=key)
 
@@ -192,11 +232,14 @@ async def import_skill(
 
     parsed = parse_skill_md(text)
 
-    if parsed:
+    if parsed.ok:
         # 标准 SKILL.md 格式
-        name, desc, instr = parsed
+        name, desc, instr = parsed.name, parsed.description, parsed.instructions
     else:
-        # 普通 Markdown：从文件名推导 name，首段作为 description
+        # 超限文件无法被中间件加载，也没有兜底意义，直接拒绝。
+        if parsed.error == ERROR_TOO_LARGE:
+            raise HTTPException(status_code=400, detail=ERROR_TOO_LARGE)
+        # 其余解析失败按普通 Markdown 兜底：从文件名推导 name，首段作为 description
         filename = file.filename or "imported-skill"
         name = re.sub(r"[^a-z0-9-]", "", filename.rsplit(".", 1)[0].lower()).strip("-")
         if not name:
@@ -221,5 +264,6 @@ async def import_skill(
         raise HTTPException(status_code=409, detail=f"技能 '{name}' 已存在")
 
     content = build_skill_md(name, desc, instr)
+    _check_size(content)
     s3.put_object(Bucket=bucket, Key=key, Body=content.encode("utf-8"))
     return SkillOut(name=name, description=desc, instructions=instr, path=key)
