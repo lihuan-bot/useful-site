@@ -73,7 +73,10 @@ class Settings(BaseSettings):
 
     # --- Agent ---
     agent_todos_enabled: bool = False  # TodoListMiddleware is opt-in in 0.7.x
-    max_concurrent_agents_per_user: int = 1
+    # Concurrent generations per user (multiple conversations running at
+    # once). Each conversation is still single-flight; the limiter only
+    # bounds the user's total in-flight producers (each holds a sandbox).
+    max_concurrent_agents_per_user: int = 4
 
     # --- Zhipu Web Search ---
     zhipu_api_key: str = ""

@@ -73,6 +73,53 @@ def add_message(
     return msg
 
 
+def create_stream_message(db: Session, conversation_id: uuid.UUID) -> Message:
+    """Insert the assistant placeholder row a stream updates in place.
+
+    Created up front so a refreshed page immediately shows the "generating"
+    bubble; the detached producer then updates content (throttled) and flips
+    ``is_complete`` at the end via :func:`update_stream_message` /
+    :func:`finalize_stream_message`.
+    """
+    msg = Message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content="",
+        is_complete=False,
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    return msg
+
+
+def update_stream_message(db: Session, message_id: uuid.UUID, content: str) -> None:
+    """Throttled in-place content update while a stream is running."""
+    db.execute(update(Message).where(Message.id == message_id).values(content=content))
+    db.commit()
+
+
+def finalize_stream_message(
+    db: Session,
+    conversation_id: uuid.UUID,
+    message_id: uuid.UUID,
+    content: str,
+    is_complete: bool,
+) -> None:
+    """Final content + completeness flip; bumps the conversation's updated_at."""
+    db.execute(
+        update(Message)
+        .where(Message.id == message_id)
+        .values(content=content, is_complete=is_complete)
+    )
+    db.execute(
+        update(Conversation)
+        .where(Conversation.id == conversation_id)
+        .values(updated_at=func.now())
+    )
+    db.commit()
+
+
 def list_messages(
     db: Session, conversation_id: uuid.UUID, *, limit: int, offset: int
 ) -> tuple[list[Message], int]:

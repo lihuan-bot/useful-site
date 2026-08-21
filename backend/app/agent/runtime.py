@@ -38,7 +38,15 @@ from dataclasses import dataclass
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
+from langgraph.graph.state import Any, CompiledStateGraph
+from langchain.agents import AgentState
+from langchain.agents.middleware.types import (
+    InputAgentState,
+    OutputAgentState,
+)
+
 from app.services.storage import ALLOWED_IMAGE_EXT, safe_relative_path
+
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +157,7 @@ async def build_multimodal_input(
 
 
 async def run_agent(
-    agent,
+    agent: CompiledStateGraph[AgentState[Any], None, InputAgentState, OutputAgentState[Any]],
     *,
     content: list | str,
     config: dict,
@@ -320,7 +328,7 @@ class SSEEventMapper:
 
 
 async def stream_agent(
-    agent,
+    agent: CompiledStateGraph[AgentState[Any], None, InputAgentState, OutputAgentState[Any]],
     mapper: SSEEventMapper,
     *,
     content: list | str,

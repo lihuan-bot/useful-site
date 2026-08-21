@@ -141,7 +141,8 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("rag disabled: EMBEDDING_BASE_URL not configured")
     app.state.user_limiter = _build_limiter(settings)
-    app.state.active_streams = {}  # conversation_id -> asyncio.Task
+    app.state.active_streams = {}  # conversation_id -> producer asyncio.Task
+    app.state.stream_brokers = {}  # conversation_id -> StreamBroker | None (None = reserved)
 
     # 4) OpenSandbox pool warmup (Phase 4+). Blocking; must run off the loop.
     import asyncio
@@ -178,6 +179,23 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown: clean up in reverse order.
+    # Cancel in-flight stream producers first so their finally blocks mirror
+    # partial text and return sandboxes before the pool is force-destroyed.
+    producers = list(app.state.active_streams.values())
+    for task in producers:
+        task.cancel()
+    if producers:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*producers, return_exceptions=True), timeout=10
+            )
+        except TimeoutError:
+            logger.warning(
+                "shutdown: %d producer(s) did not finish in time; "
+                "sandbox pool shutdown will force-destroy their sandboxes",
+                len(producers),
+            )
+
     # graceful=False: force-destroy idle sandboxes immediately.
     # In --reload mode uvicorn gives only ~5s before SIGKILL; waiting for
     # in-flight ops would leave orphan sandboxes on the server.
