@@ -15,6 +15,16 @@ Architecture
 Zero asyncio, zero background event loops. The pool uses a ThreadPoolExecutor
 for parallel warmup and a daemon thread for the reconcile loop.
 
+Multi-worker
+------------
+
+Pool state lives in Redis (``RedisPoolStateStore``): all workers share ONE
+logical pool — a single shared idle buffer and a real primary lock so only
+one worker's reconciler warms/reaps at a time. This is why the wrapper
+REQUIRES ``redis_url``; the per-process ``InMemoryPoolStateStore`` would let
+every worker's reconciler believe it is primary and warm ``max_idle``
+sandboxes each (N× waste) with no shared idle buffer.
+
 Usage
 -----
 
@@ -23,7 +33,8 @@ Usage
         domain="http://127.0.0.1:10000",
         api_key="123456",
         image="...",
-        max_idle=3,  # keep 3 sandboxes ready
+        redis_url="redis://...",
+        max_idle=3,  # keep 3 sandboxes ready (shared across workers)
     )
 
     # Every request — instant backend acquisition
@@ -42,16 +53,18 @@ import logging
 from datetime import timedelta
 from typing import ClassVar
 
+import redis
+
 from deepagents.backends.protocol import (
     ExecuteResponse,
     FileDownloadResponse,
     FileUploadResponse,
 )
 from deepagents.backends.sandbox import BaseSandbox
-from opensandbox._pool_store import InMemoryPoolStateStore
 from opensandbox.config.connection_sync import ConnectionConfigSync
 from opensandbox.models.filesystem import WriteEntry
 from opensandbox.pool_types import AcquirePolicy, PoolCreationSpec
+from opensandbox.redis_pool_store import RedisPoolStateStore
 from opensandbox.sync.pool import SandboxPoolSync
 from opensandbox.sync.sandbox import SandboxSync
 
@@ -90,6 +103,7 @@ class PreheatedSyncOpenSandboxBackend(BaseSandbox):
         entrypoint: list[str] | None = None,
         api_key: str | None = None,
         *,
+        redis_url: str,
         max_idle: int = 3,
         warmup_concurrency: int | None = None,
         reconcile_interval: timedelta = timedelta(seconds=5),
@@ -108,7 +122,9 @@ class PreheatedSyncOpenSandboxBackend(BaseSandbox):
             image: Container image.
             entrypoint: Override the default entrypoint.
             api_key: ``OPEN-SANDBOX-API-KEY``.
-            max_idle: Number of sandboxes to keep warm in the pool.
+            redis_url: Redis for the shared pool state store (multi-worker:
+                one logical pool, single reconciler via the primary lock).
+            max_idle: Number of sandboxes to keep warm in the shared pool.
             warmup_concurrency: Max parallel warmup creates
                 (default: min(max_idle, 10)).
             reconcile_interval: Seconds between pool replenishment checks.
@@ -138,6 +154,13 @@ class PreheatedSyncOpenSandboxBackend(BaseSandbox):
         if warmup_concurrency is None:
             warmup_concurrency = min(max_idle, 10)
 
+        # Shared Redis state store: all workers draw from one idle buffer;
+        # the primary lock (real with Redis) lets only one worker's
+        # reconciler warm/reap. A sync client is correct here — the pool is
+        # thread-based and never touches the event loop.
+        state_store = RedisPoolStateStore(
+            redis.Redis.from_url(redis_url, socket_connect_timeout=10)
+        )
         pool = SandboxPoolSync(
             pool_name=pool_name,
             max_idle=max_idle,
@@ -145,7 +168,7 @@ class PreheatedSyncOpenSandboxBackend(BaseSandbox):
             reconcile_interval=reconcile_interval,
             connection_config=config,
             creation_spec=creation_spec,
-            state_store=InMemoryPoolStateStore(),
+            state_store=state_store,
             idle_timeout=idle_timeout,
             warmup_ready_timeout=ready_timeout,
             acquire_ready_timeout=ready_timeout,

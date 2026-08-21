@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 1024  # must match chunks.embedding vector(N)
     embedding_batch_size: int = 16
 
+    # --- Redis (stream coordination) ---
+    # Required: stream events, single-flight reservations, per-user caps and
+    # /stop all live in Redis (see app/services/stream_store.py). Fails
+    # startup when empty/unreachable.
+    redis_url: str = ""
+
     # --- Agent ---
     agent_todos_enabled: bool = False  # TodoListMiddleware is opt-in in 0.7.x
     # Concurrent generations per user (multiple conversations running at

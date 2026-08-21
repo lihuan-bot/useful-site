@@ -2,9 +2,11 @@
 
 Streaming is split into a detached **producer** task (runs the agent, owns
 the sandbox / limiter slot / DB mirror) and per-connection **subscribers**
-(replay the broker buffer, then follow live events). A client disconnect —
-e.g. a browser refresh — only removes its subscriber; generation continues
+(replay the event log, then follow live events). A client disconnect — e.g.
+a browser refresh — only removes its subscriber; generation continues
 server-side and the refreshed page re-attaches via ``GET .../stream``.
+All coordination goes through ``app.state.stream_store`` (Redis-backed,
+see ``app/services/stream_store.py``).
 """
 
 from __future__ import annotations
@@ -21,7 +23,6 @@ from sqlalchemy.orm import Session
 from app.agent.backend_factory import build_backend_sync, kill_sandbox
 from app.agent.factory import build_agent, get_llm
 from app.agent.runtime import (
-    KEEPALIVE_SECONDS,
     SSEEventMapper,
     build_multimodal_input,
     run_agent,
@@ -35,7 +36,7 @@ from app.db.models import User
 from app.db.session import get_db
 from app.schemas.conversation import ChatRequest, ChatResponse, MessageOut
 from app.services import conversation_service as svc
-from app.services.stream_broker import StreamBroker
+from app.services.stream_store import STREAM_END, StreamStore
 from app.tools.registry import build_tools
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,8 @@ router = APIRouter(tags=["chat"])
 
 # Throttle for the incremental assistant-text mirror while a stream runs.
 MIRROR_INTERVAL_SECONDS = 2.0
+# Producer heartbeat: refreshes the reservation lock / per-user liveness.
+HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 _STREAM_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -135,10 +138,10 @@ async def send_message(
 async def _produce_events(
     *,
     request: Request,
+    store: StreamStore,
     agent,
     sandbox,
     mapper: SSEEventMapper,
-    broker: StreamBroker,
     conv_id: uuid.UUID,
     stream_msg_id: uuid.UUID,
     user_content,
@@ -146,12 +149,14 @@ async def _produce_events(
     thread_id: str,
     user_key: str,
 ) -> None:
-    """Detached producer: run the agent and fan events out to the broker.
+    """Detached producer: run the agent and publish events to the store.
 
     Runs on its own task so a client disconnect (refresh) only kills the HTTP
-    subscriber, never the generation. Cleanup lives in ``finally``: sandbox,
-    limiter slot and the DB mirror are held for the lifetime of the
-    generation, not of the connection. The producer uses its own DB session —
+    subscriber, never the generation. Three child tasks: the stream itself, a
+    heartbeat (refreshes the reservation lock) and a stop listener (cross-
+    worker /stop via the store). Cleanup lives in ``finally``: the END marker
+    is published before the reservation is released, then sandbox, per-user
+    slot and the DB mirror are freed. The producer uses its own DB session —
     the request-scoped one closes when the response ends.
     """
     conv_key = str(conv_id)
@@ -162,12 +167,14 @@ async def _produce_events(
     started = time.perf_counter()
     completed = False
     last_mirror = 0.0
-    try:
+
+    async def run_stream() -> None:
+        nonlocal completed, last_mirror
         async for event in stream_agent(agent, mapper, content=user_content, config=config):
             if event.startswith(": keepalive"):
-                # Keepalives are the subscriber's job; don't pollute the replay buffer.
+                # Keepalives are the subscriber's job; don't pollute the replay log.
                 continue
-            broker.publish(event)
+            await store.publish(conv_key, event)
             now = time.perf_counter()
             if mapper.assistant_text and now - last_mirror >= MIRROR_INTERVAL_SECONDS:
                 last_mirror = now
@@ -175,22 +182,49 @@ async def _produce_events(
                     svc.update_stream_message, mirror_db, stream_msg_id, mapper.assistant_text,
                 )
         completed = True
-    except asyncio.CancelledError:
-        # /stop or server shutdown: stop generating. The finally block still
-        # mirrors the partial text (is_complete=False) and releases resources.
-        logger.warning(
-            "agent stream cancelled: thread=%s elapsed=%.0fms",
-            thread_id, (time.perf_counter() - started) * 1000,
+
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            await store.heartbeat(conv_key)
+
+    stream_task = asyncio.create_task(run_stream())
+    heartbeat_task = asyncio.create_task(heartbeat())
+    stop_task = asyncio.create_task(store.wait_stop(conv_key))
+    try:
+        done, _ = await asyncio.wait(
+            {stream_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
         )
+        if stop_task in done:
+            stream_task.cancel()
+            stream_exc = (await asyncio.gather(stream_task, return_exceptions=True))[0]
+            if stream_exc and not isinstance(stream_exc, asyncio.CancelledError):
+                logger.warning("agent stream error ignored after stop: %s", stream_exc)
+            logger.warning(
+                "agent stream cancelled: thread=%s elapsed=%.0fms",
+                thread_id, (time.perf_counter() - started) * 1000,
+            )
+        else:
+            stop_task.cancel()
+            await stream_task  # raises on agent failure → outer except
+    except asyncio.CancelledError:
+        # Producer itself cancelled (server shutdown): fall through to cleanup.
+        logger.warning("agent producer cancelled: thread=%s", thread_id)
     except Exception as exc:
         logger.exception("agent stream failed: thread=%s", thread_id)
-        broker.publish(mapper.error_event("agent_error", str(exc)[:300]))
+        await store.publish(conv_key, mapper.error_event("agent_error", str(exc)[:300]))
     finally:
-        broker.finish()
+        heartbeat_task.cancel()
+        stop_task.cancel()
+        await asyncio.gather(heartbeat_task, stop_task, return_exceptions=True)
+        try:
+            await store.publish(conv_key, STREAM_END)
+        except Exception:
+            logger.exception("failed to publish stream end marker")
         request.app.state.active_streams.pop(conv_key, None)
-        request.app.state.stream_brokers.pop(conv_key, None)
+        await store.release(conv_key)
+        await store.user_release(user_key, conv_key)
         await kill_sandbox(sandbox)
-        request.app.state.user_limiter.release(user_key)
         try:
             await asyncio.to_thread(
                 svc.finalize_stream_message,
@@ -208,31 +242,6 @@ async def _produce_events(
         )
 
 
-async def _follow_broker(broker: StreamBroker):
-    """SSE generator: replay buffered events, then follow live ones.
-
-    Emits its own keepalives so the connection stays warm during long tool
-    runs, and unsubscribes on disconnect (the producer keeps running).
-    """
-    replay, queue = broker.subscribe()
-    try:
-        for event in replay:
-            yield event
-        if broker.closed:
-            return
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), KEEPALIVE_SECONDS)
-            except TimeoutError:
-                yield ": keepalive\n\n"
-                continue
-            if event is None:  # producer finished
-                return
-            yield event
-    finally:
-        broker.unsubscribe(queue)
-
-
 @router.post("/conversations/{conversation_id}/stream")
 async def stream_chat(
     conversation_id: uuid.UUID,
@@ -243,25 +252,23 @@ async def stream_chat(
 ) -> StreamingResponse:
     conv = svc.get_or_404(db, conversation_id, user.id)
     conv_key = str(conv.id)
-    brokers = request.app.state.stream_brokers
-
-    # Single-flight per conversation: a second POST while one generation is
-    # running would mirror the user message twice and fork the thread.
-    # Check + reserve are atomic (no await in between): concurrent POSTs
-    # can't both slip through. The reservation is swapped for the real
-    # broker once the producer is ready; GET attaches while the entry is
-    # None see pending=true and retry.
-    if conv_key in brokers:
-        raise HTTPException(status_code=409, detail="该会话已有进行中的生成")
-    brokers[conv_key] = None
-
-    limiter = request.app.state.user_limiter
+    store: StreamStore = request.app.state.stream_store
     user_key = str(user.id)
-    if not await limiter.try_acquire(user_key):
-        brokers.pop(conv_key, None)
-        raise HTTPException(status_code=429, detail="并发会话数已达上限，请稍候")
-
     settings = get_settings()
+
+    # Single-flight per conversation (cross-worker via the store): a second
+    # POST while one generation is running would mirror the user message
+    # twice and fork the thread. Reserve BEFORE the user-cap check and hold
+    # the reservation until the producer is running.
+    if not await store.reserve(conv_key, user_key):
+        raise HTTPException(status_code=409, detail="该会话已有进行中的生成")
+    try:
+        if not await store.user_acquire(user_key, conv_key, settings.max_concurrent_agents_per_user):
+            raise HTTPException(status_code=429, detail="并发会话数已达上限，请稍候")
+    except BaseException:
+        await store.release(conv_key)
+        raise
+
     user_content = await build_multimodal_input(
         body.content,
         body.image_paths,
@@ -280,8 +287,8 @@ async def stream_chat(
         agent, sandbox, thread_id = await _prepare_run(request, user, conv.id)
         stream_msg = svc.create_stream_message(db, conv.id)
     except Exception:
-        brokers.pop(conv_key, None)
-        limiter.release(user_key)
+        await store.user_release(user_key, conv_key)
+        await store.release(conv_key)
         raise
 
     config = {"configurable": {"thread_id": thread_id}}
@@ -290,14 +297,12 @@ async def stream_chat(
         thread_id=thread_id,
         base_url=str(request.base_url),
     )
-    broker = StreamBroker()
-    brokers[conv_key] = broker
     producer = asyncio.create_task(_produce_events(
         request=request,
+        store=store,
         agent=agent,
         sandbox=sandbox,
         mapper=mapper,
-        broker=broker,
         conv_id=conv.id,
         stream_msg_id=stream_msg.id,
         user_content=user_content,
@@ -305,12 +310,13 @@ async def stream_chat(
         thread_id=thread_id,
         user_key=user_key,
     ))
+    # Local handle for shutdown cancellation; /stop goes through the store.
     request.app.state.active_streams[conv_key] = producer
     logger.info(
         "agent stream start: conversation=%s thread=%s content_len=%d images=%d vision=%s",
         conv.id, thread_id, len(body.content), len(body.image_paths or []), settings.llm_supports_vision,
     )
-    return _sse_stream(_follow_broker(broker))
+    return _sse_stream(store.follow(conv_key))
 
 
 @router.get("/conversations/{conversation_id}/stream")
@@ -322,25 +328,23 @@ async def attach_stream(
 ) -> StreamingResponse:
     """Re-attach to an in-flight generation (e.g. after a browser refresh).
 
-    Replays buffered events and follows live ones. When nothing is running
-    (or the producer is still spinning up), a single ``status`` event tells
-    the client what to do: ``active=false`` → render from the messages
-    endpoint; ``pending=true`` → retry in a moment.
+    Replays the event log and follows live events — works from any worker
+    when the store is Redis-backed. When nothing is running (or the producer
+    is still spinning up), a single ``status`` event tells the client what
+    to do: ``active=false`` → render from the messages endpoint;
+    ``pending=true`` → retry in a moment.
     """
     svc.get_or_404(db, conversation_id, user.id)
-    brokers = request.app.state.stream_brokers
-    conv_key = str(conversation_id)
-    broker = brokers.get(conv_key)
+    store: StreamStore = request.app.state.stream_store
+    state = await store.state(str(conversation_id))
 
-    if broker is None:
-        pending = conv_key in brokers  # reserved, producer not up yet
-
+    if state != "active":
         async def status_only():
-            yield sse("status", {"active": pending, "pending": pending})
+            yield sse("status", {"active": state != "inactive", "pending": state == "pending"})
 
         return _sse_stream(status_only)
 
-    return _sse_stream(_follow_broker(broker))
+    return _sse_stream(store.follow(str(conversation_id)))
 
 
 @router.post("/conversations/{conversation_id}/stop")
@@ -350,14 +354,19 @@ async def stop_generation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Cancel an in-progress agent stream for this conversation."""
+    """Cancel an in-progress agent stream for this conversation.
+
+    Cross-worker: the store notifies the producer regardless of which worker
+    hosts it.
+    """
     # Verify ownership.
     svc.get_or_404(db, conversation_id, user.id)
 
-    task = request.app.state.active_streams.get(str(conversation_id))
-    if task is None:
+    store: StreamStore = request.app.state.stream_store
+    conv_key = str(conversation_id)
+    if not await store.is_active(conv_key):
         raise HTTPException(status_code=404, detail="没有正在进行的生成任务")
 
-    task.cancel()
+    await store.request_stop(conv_key)
     logger.info("stop requested: conversation=%s", conversation_id)
     return {"status": "cancelling"}

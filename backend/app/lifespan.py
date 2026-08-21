@@ -13,7 +13,10 @@ gracefully when a resource is absent.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -34,6 +37,7 @@ def _validate_settings(settings: Settings) -> None:
         "RUSTFS_SECRET_KEY": settings.rustfs_secret_key,
         "OPENSANDBOX_DOMAIN": settings.opensandbox_domain,
         "OPENSANDBOX_API_KEY": settings.opensandbox_api_key,
+        "REDIS_URL": settings.redis_url,
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
@@ -44,12 +48,6 @@ def _validate_settings(settings: Settings) -> None:
         raise RuntimeError("JWT_SECRET must be set in production")
     if settings.env == "prod" and not settings.llm_api_key:
         raise RuntimeError("LLM_API_KEY must be set in production")
-
-
-def _build_limiter(settings: Settings):
-    from app.backends.limiter import UserLimiter
-
-    return UserLimiter(settings.max_concurrent_agents_per_user)
 
 
 def _cleanup_orphan_sandboxes(settings: Settings) -> None:
@@ -140,9 +138,13 @@ async def lifespan(app: FastAPI):
             logger.warning("RAG disabled: %s", exc)
     else:
         logger.warning("rag disabled: EMBEDDING_BASE_URL not configured")
-    app.state.user_limiter = _build_limiter(settings)
+    # Local producer tasks, for shutdown cancellation only; /stop and attach
+    # coordinate through app.state.stream_store (Redis-backed).
     app.state.active_streams = {}  # conversation_id -> producer asyncio.Task
-    app.state.stream_brokers = {}  # conversation_id -> StreamBroker | None (None = reserved)
+    from app.services.stream_store import build_stream_store
+
+    app.state.stream_store = await build_stream_store(settings)
+    logger.info("stream store ready (redis)")
 
     # 4) OpenSandbox pool warmup (Phase 4+). Blocking; must run off the loop.
     import asyncio
@@ -150,16 +152,44 @@ async def lifespan(app: FastAPI):
     from sandbox.pool import PreheatedSyncOpenSandboxBackend
 
     # Clean up orphaned sandboxes from previous (crashed) processes before
-    # starting the pool — otherwise they accumulate across reloads.
-    await asyncio.to_thread(
-        _cleanup_orphan_sandboxes, settings
-    )
+    # starting the pool — otherwise they accumulate across reloads. The
+    # sweep runs ONLY when no other worker's pool lease is alive: a
+    # staggered/rolling start must not destroy a running worker's
+    # pre-warmed sandboxes (leases are refreshed every 30s and expire 60s
+    # after a crash). The Redis lock serializes the sweep itself.
+    store = app.state.stream_store
+    app.state.pool_worker_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    if await store.try_acquire_cleanup_lock():
+        try:
+            if await store.pool_workers_alive():
+                logger.info("orphan cleanup: another worker's pool is alive, skipping")
+            else:
+                await asyncio.to_thread(_cleanup_orphan_sandboxes, settings)
+            # Register this worker's lease before releasing the lock so a
+            # concurrently starting worker sees it and skips the sweep.
+            await store.register_pool_worker(app.state.pool_worker_id)
+        finally:
+            await store.release_cleanup_lock()
+    else:
+        # Another worker is sweeping; our pool doesn't exist yet, so this
+        # worker is safe from it. Register the lease regardless.
+        logger.info("orphan cleanup: another worker holds the lock, skipping")
+        await store.register_pool_worker(app.state.pool_worker_id)
+
+    async def _pool_worker_heartbeat() -> None:
+        worker_id = app.state.pool_worker_id
+        while True:
+            await store.register_pool_worker(worker_id)
+            await asyncio.sleep(30.0)
+
+    app.state.pool_heartbeat_task = asyncio.create_task(_pool_worker_heartbeat())
 
     await asyncio.to_thread(
         PreheatedSyncOpenSandboxBackend.start_pool,
         domain=settings.opensandbox_domain,
         api_key=settings.opensandbox_api_key,
         image=settings.opensandbox_image,
+        redis_url=settings.redis_url,
         max_idle=settings.opensandbox_max_idle,
         use_server_proxy=settings.opensandbox_use_server_proxy,
         wait_for_warmup=True,
@@ -196,6 +226,19 @@ async def lifespan(app: FastAPI):
                 len(producers),
             )
 
+    # Stop refreshing the pool-worker lease and deregister so a restart
+    # knows it may sweep. Rolling restarts are unaffected: surviving
+    # workers keep refreshing their own leases.
+    heartbeat_task = getattr(app.state, "pool_heartbeat_task", None)
+    if heartbeat_task is not None:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+    if getattr(app.state, "stream_store", None) is not None:
+        try:
+            await app.state.stream_store.unregister_pool_worker(app.state.pool_worker_id)
+        except Exception:
+            logger.warning("failed to unregister pool worker lease")
+
     # graceful=False: force-destroy idle sandboxes immediately.
     # In --reload mode uvicorn gives only ~5s before SIGKILL; waiting for
     # in-flight ops would leave orphan sandboxes on the server.
@@ -205,4 +248,6 @@ async def lifespan(app: FastAPI):
         await app.state.checkpointer.aclose()
     if db_session.engine is not None:
         db_session.engine.dispose()
+    if getattr(app.state, "stream_store", None) is not None:
+        await app.state.stream_store.close()
     logger.info("shutdown complete")

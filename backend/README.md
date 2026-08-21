@@ -60,7 +60,7 @@ uv run uvicorn main:app --port 8000
 
 ## 运维注意
 
-- **单 worker**：沙箱预热池与内存并发限流器是进程内的；多 worker 时预热沙箱数 = workers × `OPENSANDBOX_MAX_IDLE`，跨 worker 限流需改 PG advisory lock。
+- **Redis 必填**：流事件、会话单飞、每用户并发上限与 `/stop` 信号全部入 Redis（`app/services/stream_store.py`，`REDIS_URL` 未配置或连不上则启动失败），任意 worker 可 attach/stop 任意会话，单/多 worker 同一条代码路径。沙箱预热池也共享：状态在 Redis（`RedisPoolStateStore`，primary lock 保证只有一个 worker 的 reconciler 预热/回收），预热总数 = `OPENSANDBOX_MAX_IDLE`（多 worker 建议调大，如 workers × 3）；孤儿沙箱清理带互斥锁 + worker 存活租约，只扫真孤儿。
 - **沙箱回收**：每个请求从预热池取沙箱、用完即杀；异常/断连由 finally 兜底，服务端 TTL（10 分钟）双保险。
 - **pgvector**：远程 PG 为 Docker 部署，扩展装在容器层（`postgresql-17-pgvector`）；重建 `pgsql` 容器后需重新安装并 `CREATE EXTENSION vector`。
 - **对话真相源**：messages 表仅为展示镜像；续聊恢复依赖 checkpointer 的 `thread_id = {user_id}:{conversation_id}`。
