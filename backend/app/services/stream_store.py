@@ -10,9 +10,17 @@ Redis layout (prefix ``stream``):
 
 - ``stream:lock:{conv}``    SET NX EX 120 — single-flight reservation, value
                             = user id; the producer's heartbeat refreshes it.
-- ``stream:events:{conv}``  Stream, MAXLEN ~500 — event log; each publish
-                            refreshes a 600s EXPIRE. Last event is always
-                            ``STREAM_END`` when the producer finished.
+- ``stream:current:{conv}`` SET EX 600 — points at the CURRENT generation id;
+                            overwritten by each new POST. Subscribers follow
+                            the stream behind this pointer, so a new question
+                            never replays the previous answer's events.
+- ``stream:events:{conv}:{gen}`` Stream, MAXLEN ~500 — one event log per
+                            generation; each publish refreshes a 600s EXPIRE.
+                            Last event is always ``STREAM_END``.
+- ``stream:status:{user}``  Stream, MAXLEN ~200 — conversation status
+                            transitions (running/done/interrupted) so an open
+                            page updates its list in real time via one SSE
+                            subscription instead of polling the list.
 - ``stream:stopreq:{conv}`` SET EX 60 — covers a /stop racing producer start.
 - ``stream:stop:{conv}``    pub/sub channel — live stop signal.
 - ``stream:user:{uid}``     ZSET score=epoch member=conv — per-user active
@@ -29,8 +37,8 @@ Redis layout (prefix ``stream``):
 
 from __future__ import annotations
 
-import asyncio
 import time
+import uuid
 from collections.abc import AsyncIterator
 
 import redis.asyncio as aioredis
@@ -106,57 +114,118 @@ class StreamStore:
 
     # -- events --------------------------------------------------------
 
+    async def begin_generation(self, conv_key: str) -> str:
+        """Start a new event-log generation and point ``current`` at it.
+
+        Called once per POST (single-flight reservation guarantees only one
+        producer). Replay is generation-scoped: a new question never
+        surfaces the previous answer's events or its END marker.
+        """
+        gen = uuid.uuid4().hex
+        await self._r.set(self._k("current", conv_key), gen, ex=EVENTS_TTL_SECONDS)
+        return gen
+
     async def publish(self, conv_key: str, event: str) -> None:
-        key = self._k("events", conv_key)
+        gen = await self._r.get(self._k("current", conv_key))
+        if gen is None:
+            return  # generation pointer expired; nothing to publish into
+        gen = gen.decode()
+        key = self._k("events", f"{conv_key}:{gen}")
         pipe = self._r.pipeline()
         pipe.xadd(key, {"e": event.encode()}, maxlen=MAX_REPLAY_EVENTS, approximate=True)
         pipe.expire(key, EVENTS_TTL_SECONDS)
+        pipe.expire(self._k("current", conv_key), EVENTS_TTL_SECONDS)
         await pipe.execute()
 
     async def follow(self, conv_key: str) -> AsyncIterator[str]:
-        """Replay the stream from the beginning, then follow live events.
+        """Replay the CURRENT generation's stream, then follow live events.
 
         Yields SSE strings; on producer death (lock expiry) the iterator
         ends quietly. Uses a dedicated Redis connection so cancelling the
         generator (client disconnect) closes a socket we don't share.
         """
-        key = self._k("events", conv_key)
+        gen = await self._r.get(self._k("current", conv_key))
+        if gen is None:
+            return  # nothing to replay; caller checked state, producer just ended
+        key = self._k("events", f"{conv_key}:{gen.decode()}")
+        async for event in self._follow_key(
+            key, end_marker=STREAM_END, liveness_conv=conv_key
+        ):
+            yield event
+
+    async def publish_status(self, user_key: str, event: str) -> None:
+        """Append a conversation-status SSE event to the user's status stream."""
+        key = self._k("status", user_key)
+        pipe = self._r.pipeline()
+        pipe.xadd(key, {"e": event.encode()}, maxlen=MAX_REPLAY_EVENTS, approximate=True)
+        pipe.expire(key, EVENTS_TTL_SECONDS)
+        await pipe.execute()
+
+    def follow_status(self, user_key: str) -> AsyncIterator[str]:
+        """Follow the user's conversation-status stream (replay, then live).
+
+        No end marker and no liveness check: the status channel is a
+        persistent subscription the page keeps open; only a disconnect or a
+        server-side close ends it.
+        """
+        return self._follow_key(self._k("status", user_key))
+
+    async def _follow_key(
+        self,
+        key: str,
+        *,
+        end_marker: str | None = None,
+        liveness_conv: str | None = None,
+    ) -> AsyncIterator[str]:
+        """Shared replay+follow loop over one Redis Stream.
+
+        Yields SSE strings (with keepalives on silence). When
+        ``end_marker`` is seen the iterator returns; when ``liveness_conv``
+        is set, the loop also returns if that conversation's producer lock
+        disappears (crash without an end marker). Uses a dedicated Redis
+        connection so cancelling the generator (client disconnect) closes a
+        socket we don't share.
+        """
         client = aioredis.Redis.from_url(self._url)
         cursor: bytes | str = b"0-0"
+        end_raw = end_marker.encode() if end_marker else None
         try:
             res = await client.xread({key: b"0-0"}, count=MAX_REPLAY_EVENTS)
-            for _name, entries in res or []:
+            for _, entries in res or []:
                 for msg_id, fields in entries:
                     raw = fields.get(b"e")
                     if raw is None:
                         continue
                     cursor = msg_id
-                    if raw == STREAM_END.encode():
+                    if end_raw is not None and raw == end_raw:
                         return
                     yield raw.decode("utf-8")
             while True:
                 res = await client.xread({key: cursor}, count=100, block=KEEPALIVE_MS)
                 if not res:
                     yield ": keepalive\n\n"
-                    if not await self.is_active(conv_key):
-                        # Producer gone (crash) without an end marker: stop.
+                    if liveness_conv is not None and not await self.is_active(liveness_conv):
                         return
                     continue
-                for _name, entries in res:
+                for _, entries in res:
                     for msg_id, fields in entries:
                         raw = fields.get(b"e")
                         if raw is None:
                             continue
                         cursor = msg_id
-                        if raw == STREAM_END.encode():
+                        if end_raw is not None and raw == end_raw:
                             return
                         yield raw.decode("utf-8")
         finally:
             await client.aclose()
 
     async def state(self, conv_key: str) -> str:
-        """``'active'`` (event log exists) | ``'pending'`` (reserved) | ``'inactive'``."""
-        if await self._r.exists(self._k("events", conv_key)):
+        """``'active'`` (current generation's log exists) | ``'pending'``
+        (reserved, not publishing yet) | ``'inactive'``."""
+        gen = await self._r.get(self._k("current", conv_key))
+        if gen is not None and await self._r.exists(
+            self._k("events", f"{conv_key}:{gen.decode()}")
+        ):
             return "active"
         if await self._r.exists(self._k("lock", conv_key)):
             return "pending"
@@ -164,6 +233,20 @@ class StreamStore:
 
     async def is_active(self, conv_key: str) -> bool:
         return bool(await self._r.exists(self._k("lock", conv_key)))
+
+    async def active_locks(self, conv_keys: list[str]) -> set[str]:
+        """Which of these conversations currently hold a producer reservation.
+
+        Batched pipeline so the conversation list can annotate every row
+        with one Redis round-trip.
+        """
+        if not conv_keys:
+            return set()
+        pipe = self._r.pipeline()
+        for conv_key in conv_keys:
+            pipe.exists(self._k("lock", conv_key))
+        results = await pipe.execute()
+        return {k for k, ok in zip(conv_keys, results) if ok}
 
     # -- control -------------------------------------------------------
 

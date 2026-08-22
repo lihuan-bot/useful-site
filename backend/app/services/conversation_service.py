@@ -120,6 +120,28 @@ def finalize_stream_message(
     db.commit()
 
 
+def latest_message_flags(
+    db: Session, conversation_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, bool]:
+    """Map conversation_id → latest message's ``is_complete``.
+
+    Conversations without any message are absent (callers default to True).
+    One query for the whole list page (Postgres DISTINCT ON).
+    """
+    if not conversation_ids:
+        return {}
+    latest = (
+        select(Message.conversation_id, Message.is_complete)
+        .distinct(Message.conversation_id)
+        .where(Message.conversation_id.in_(conversation_ids))
+        .order_by(Message.conversation_id, Message.created_at.desc())
+    ).subquery()
+    rows = db.execute(
+        select(latest.c.conversation_id, latest.c.is_complete)
+    ).all()
+    return {cid: complete for cid, complete in rows}
+
+
 def list_messages(
     db: Session, conversation_id: uuid.UUID, *, limit: int, offset: int
 ) -> tuple[list[Message], int]:

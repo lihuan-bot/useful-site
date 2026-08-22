@@ -168,6 +168,13 @@ async def _produce_events(
     completed = False
     last_mirror = 0.0
 
+    # Notify the user's status channel: the conversation list lights up this
+    # conversation's spinner without polling.
+    await store.publish_status(
+        user_key,
+        sse("conversation_status", {"conversation_id": conv_key, "status": "running"}),
+    )
+
     async def run_stream() -> None:
         nonlocal completed, last_mirror
         async for event in stream_agent(agent, mapper, content=user_content, config=config):
@@ -221,6 +228,19 @@ async def _produce_events(
             await store.publish(conv_key, STREAM_END)
         except Exception:
             logger.exception("failed to publish stream end marker")
+        try:
+            await store.publish_status(
+                user_key,
+                sse(
+                    "conversation_status",
+                    {
+                        "conversation_id": conv_key,
+                        "status": "done" if completed else "interrupted",
+                    },
+                ),
+            )
+        except Exception:
+            logger.exception("failed to publish conversation status")
         request.app.state.active_streams.pop(conv_key, None)
         await store.release(conv_key)
         await store.user_release(user_key, conv_key)
@@ -286,6 +306,9 @@ async def stream_chat(
 
         agent, sandbox, thread_id = await _prepare_run(request, user, conv.id)
         stream_msg = svc.create_stream_message(db, conv.id)
+        # New generation id: subscribers replay ONLY this generation's
+        # events, never the previous answer's log (or its END marker).
+        await store.begin_generation(conv_key)
     except Exception:
         await store.user_release(user_key, conv_key)
         await store.release(conv_key)

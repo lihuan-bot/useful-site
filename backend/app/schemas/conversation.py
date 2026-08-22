@@ -18,6 +18,11 @@ class ConversationOut(BaseModel):
     title: str
     created_at: datetime
     updated_at: datetime
+    streaming: bool = False
+    """A generation for this conversation is actively running."""
+    interrupted: bool = False
+    """Latest assistant reply is incomplete but no producer is running
+    (stopped by the user or the process died)."""
 
     model_config = {"from_attributes": True}
 
