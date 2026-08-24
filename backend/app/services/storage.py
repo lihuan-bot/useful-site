@@ -69,6 +69,20 @@ def user_skills_prefix(user_id: str) -> str:
     return f"users/{user_id}/skills"
 
 
+def user_artifacts_prefix(user_id: str, conversation_id: str | None = None) -> str:
+    """S3 key prefix for middleware-offloaded artifacts.
+
+    deepagents' FilesystemMiddleware writes oversized tool results and
+    evicted conversation history under ``/files/artifacts/{conversation}/``
+    (see ``app/agent/backend_factory.py``).  With no ``conversation_id``
+    the per-user root is returned, for listing/sweeping.
+    """
+    prefix = f"{user_files_prefix(user_id)}/artifacts"
+    if conversation_id is not None:
+        prefix = f"{prefix}/{conversation_id}"
+    return prefix
+
+
 # ---------------------------------------------------------------------------
 # S3 helpers — shared by the files/skills REST endpoints to avoid duplicating
 # the pagination loop, 404 detection, and path-escape check everywhere.
@@ -93,6 +107,24 @@ def list_objects(s3: BaseClient, bucket: str, prefix: str) -> Iterator[dict]:
         if not resp.get("IsTruncated"):
             return
         token = resp.get("NextContinuationToken")
+
+
+def delete_prefix(s3: BaseClient, bucket: str, prefix: str) -> int:
+    """Delete every object under ``prefix`` (batched; one page ≤1000 keys).
+
+    Returns the number of objects deleted.  Idempotent — an absent prefix
+    simply returns 0.
+    """
+    deleted = 0
+    while True:
+        batch = [obj["Key"] for obj in list_objects(s3, bucket, prefix)]
+        if not batch:
+            return deleted
+        s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": key} for key in batch]},
+        )
+        deleted += len(batch)
 
 
 def is_s3_not_found(exc: Exception) -> bool:

@@ -9,9 +9,11 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_user
+from app.core.config import get_settings
+from app.core.deps import get_current_user, get_s3
 from app.db.models import Conversation, User
 from app.db.session import get_db
+from app.services.storage import delete_prefix, user_artifacts_prefix
 from app.schemas.conversation import (
     ConversationCreate,
     ConversationDetail,
@@ -118,6 +120,23 @@ async def delete_conversation(
     checkpointer = request.app.state.checkpointer
     if checkpointer is not None:
         await checkpointer.saver.adelete_thread(svc.thread_id_for(user.id, conversation_id))
+    # Remove middleware-offloaded artifacts (large tool results / evicted
+    # conversation history) from RustFS. Best-effort: a storage blip must not
+    # fail the delete; the startup sweep catches leftovers.
+    try:
+        s3 = get_s3(request)
+        removed = delete_prefix(
+            s3,
+            get_settings().rustfs_bucket,
+            user_artifacts_prefix(str(user.id), str(conversation_id)),
+        )
+        if removed:
+            logger.info(
+                "conversation artifacts deleted: id=%s objects=%d",
+                conversation_id, removed,
+            )
+    except Exception:
+        logger.exception("failed to delete conversation artifacts: id=%s", conversation_id)
     logger.info("conversation deleted: id=%s", conversation_id)
 
 

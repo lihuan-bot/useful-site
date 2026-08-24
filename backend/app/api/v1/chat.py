@@ -72,6 +72,7 @@ async def _prepare_run(request: Request, user: User, conversation_id: uuid.UUID)
         settings,
         s3=get_s3(request),
         user_id=str(user.id),
+        conversation_id=str(conversation_id),
     )
     try:
         agent = build_agent(

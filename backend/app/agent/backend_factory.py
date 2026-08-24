@@ -115,7 +115,7 @@ def _inject_skills_into_sandbox(
 
 
 def build_backend_sync(
-    settings: Settings, *, s3: BaseClient, user_id: str
+    settings: Settings, *, s3: BaseClient, user_id: str, conversation_id: str
 ) -> Tuple[CompositeBackend, PreheatedSyncOpenSandboxBackend]:
     """Acquire a warm sandbox and compose the routed backend."""
     started = time.perf_counter()
@@ -135,9 +135,18 @@ def build_backend_sync(
         s3=s3, bucket=settings.rustfs_bucket, user_id=user_id,
         root=f"users/{user_id}/skills",
     )
+    # artifacts_root: deepagents' FilesystemMiddleware offloads oversized
+    # tool results and conversation history to ``{artifacts_root}/...``.
+    # It defaults to "/" — which falls through to the default route (the
+    # sandbox) and is destroyed by kill_sandbox() at end of turn, while the
+    # pointer message survives in the checkpoint. Point it at the RustFS
+    # route so offloaded content persists across turns and requests, scoped
+    # per conversation so deletion can sweep it
+    # (``user_artifacts_prefix`` / ``delete_prefix`` in services/storage.py).
     composite = CompositeBackend(
         default=sandbox,
         routes={"/files/": rustfs, "/skills/": rustfs_skills},
+        artifacts_root=f"/files/artifacts/{conversation_id}",
     )
     return composite, sandbox
 

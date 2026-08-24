@@ -97,6 +97,67 @@ def _cleanup_orphan_sandboxes(settings: Settings) -> None:
     logger.info("orphan cleanup: destroyed %d/%d sandbox(es)", destroyed, len(items))
 
 
+def _cleanup_orphan_artifacts(s3, settings: Settings) -> None:
+    """Delete RustFS artifact dirs whose conversation row no longer exists.
+
+    Offloaded content lives under ``users/{uid}/files/artifacts/{conv_id}/``.
+    The conversation-delete endpoint sweeps its own prefix, so leftovers here
+    are orphans from crashes, direct DB edits, or app versions before the
+    per-conversation layout. Age is NOT a criterion: an alive conversation's
+    checkpoint may still reference its artifacts, no matter how old.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import select
+
+    from app.db import session as db_session
+    from app.db.models import Conversation, User
+    from app.services.storage import delete_prefix, user_artifacts_prefix
+
+    bucket = settings.rustfs_bucket
+    db = db_session.SessionLocal()
+    try:
+        user_ids = [str(uid) for (uid,) in db.execute(select(User.id)).all()]
+        if not user_ids:
+            return
+        removed = 0
+        for uid in user_ids:
+            uid_uuid = _uuid.UUID(uid)
+            prefix = f"{user_artifacts_prefix(uid)}/"
+            token = None
+            while True:
+                kwargs = {"Bucket": bucket, "Prefix": prefix, "Delimiter": "/"}
+                if token:
+                    kwargs["ContinuationToken"] = token
+                resp = s3.list_objects_v2(**kwargs)
+                for common in resp.get("CommonPrefixes", []):
+                    conv_id = common["Prefix"][len(prefix):].rstrip("/")
+                    try:
+                        conv_uuid = _uuid.UUID(conv_id)
+                    except ValueError:
+                        continue  # e.g. "large_tool_results/" from pre-scoping layout
+                    exists = db.execute(
+                        select(Conversation.id).where(
+                            Conversation.id == conv_uuid,
+                            Conversation.user_id == uid_uuid,
+                        )
+                    ).first()
+                    if exists is None:
+                        n = delete_prefix(s3, bucket, common["Prefix"])
+                        removed += n
+                        logger.info(
+                            "orphan artifacts deleted: user=%s conv=%s objects=%d",
+                            uid, conv_id, n,
+                        )
+                if not resp.get("IsTruncated"):
+                    break
+                token = resp.get("NextContinuationToken")
+        if removed:
+            logger.info("orphan artifacts cleanup: removed %d object(s)", removed)
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -168,6 +229,11 @@ async def lifespan(app: FastAPI):
                 logger.info("orphan cleanup: another worker's pool is alive, skipping")
             else:
                 await asyncio.to_thread(_cleanup_orphan_sandboxes, settings)
+            # Artifact sweep is independent of pool leases (it reconciles
+            # RustFS against the conversations table), so it runs whenever
+            # this worker holds the serializing cleanup lock.
+            if app.state.s3 is not None:
+                await asyncio.to_thread(_cleanup_orphan_artifacts, app.state.s3, settings)
             # Register this worker's lease before releasing the lock so a
             # concurrently starting worker sees it and skips the sweep.
             await store.register_pool_worker(app.state.pool_worker_id)
