@@ -109,6 +109,9 @@ async def lifespan(app: FastAPI):
     app.state.engine = db_session.engine
     logger.info("db engine ready: pool_max=%d", settings.db_pool_max)
 
+    # Business tables are managed by alembic (`uv run alembic upgrade head`);
+    # the LangGraph checkpointer below creates its own tables via setup().
+
     # 2) LangGraph checkpointer (Phase 3+). Fails startup on DB misconfig.
     from app.db.checkpointer import init_checkpointer
 
@@ -179,7 +182,13 @@ async def lifespan(app: FastAPI):
     async def _pool_worker_heartbeat() -> None:
         worker_id = app.state.pool_worker_id
         while True:
-            await store.register_pool_worker(worker_id)
+            try:
+                await store.register_pool_worker(worker_id)
+            except Exception:
+                # A transient Redis error must not kill this task: once the
+                # lease expires (60s), another worker's orphan cleanup would
+                # sweep this worker's warm sandbox pool.
+                logger.warning("pool worker lease refresh failed", exc_info=True)
             await asyncio.sleep(30.0)
 
     app.state.pool_heartbeat_task = asyncio.create_task(_pool_worker_heartbeat())

@@ -37,6 +37,7 @@ import uuid
 from dataclasses import dataclass
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langgraph.errors import GraphInterrupt
 
 from langgraph.graph.state import Any, CompiledStateGraph
 from langchain.agents import AgentState
@@ -163,12 +164,26 @@ async def run_agent(
     config: dict,
 ) -> AgentRunResult:
     """Invoke the agent once (non-streaming) and return the assistant text."""
-    result = await agent.ainvoke(
-        {"messages": [{"role": "user", "content": content}]},
-        config=config,
-    )
+    try:
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": content}]},
+            config=config,
+        )
+    except GraphInterrupt:
+        # Older langgraph versions raise; newer ones return normally and
+        # expose the interrupt via state.tasks[].interrupts (checked below).
+        return AgentRunResult(text="", interrupted=True)
+    interrupted = False
+    try:
+        state = await agent.aget_state(config)
+        interrupted = bool(state.tasks and any(t.interrupts for t in state.tasks))
+    except Exception:
+        logger.exception("run_agent: failed to check interrupt state")
     messages: list[BaseMessage] = result.get("messages", [])
-    return AgentRunResult(text=extract_assistant_text(messages))
+    return AgentRunResult(
+        text=extract_assistant_text(messages),
+        interrupted=interrupted,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -199,6 +214,9 @@ class SSEEventMapper:
         self._emitted_tool_results: set[str] = set()
         self._emitted_artifacts: set[str] = set()
         self.message_id = str(uuid.uuid4())
+        # HITL: set when the graph pauses awaiting human input.
+        self.interrupted: bool = False
+        self.interrupt_payloads: list = []
 
     # -- feeds ---------------------------------------------------------
 
@@ -326,23 +344,40 @@ class SSEEventMapper:
     def error_event(self, code: str, message: str) -> str:
         return sse("error", {"code": code, "message": message})
 
+    def feed_interrupt(self, payload) -> list[str]:
+        """HITL: the graph paused and is asking the human for input.
+
+        The payload describes what is missing/invalid; the client renders a
+        form and answers via ``POST /resume`` (``Command(resume=...)``).
+        Multiple interrupts per run are possible (validation loop).
+        """
+        self.interrupted = True
+        self.interrupt_payloads.append(payload)
+        logger.info("interrupt: payload=%s", str(payload)[:200])
+        return [sse("interrupt", {"payload": payload})]
+
 
 async def stream_agent(
     agent: CompiledStateGraph[AgentState[Any], None, InputAgentState, OutputAgentState[Any]],
     mapper: SSEEventMapper,
     *,
-    content: list | str,
+    run_input,
     config: dict,
 ):
     """Async generator: SSE event strings for one agent run (astream_events v3).
 
+    ``run_input`` is the graph input: a user-message dict for normal turns,
+    or ``Command(resume=...)`` to resume a paused (interrupted) run.
+
     Yields keepalive comments while the agent is silent (long tool runs), a
-    ``done`` event on success, and an ``error`` event on failure. The caller
-    owns ``mapper`` (reads ``mapper.assistant_text`` afterwards) and backend
-    cleanup (finally) — see the chat endpoint.
+    ``done`` event on success, ``interrupt`` event(s) when the graph pauses
+    awaiting human input (see ``mapper.feed_interrupt``), and an ``error``
+    event on failure. The caller owns ``mapper`` (reads
+    ``mapper.assistant_text`` / ``mapper.interrupted`` afterwards) and
+    backend cleanup (finally) — see the chat endpoint.
     """
     run = await agent.astream_events(
-        {"messages": [{"role": "user", "content": content}]},
+        run_input,
         config=config,
         version="v3",
         durability="exit",
@@ -364,7 +399,7 @@ async def stream_agent(
         try:
             async for ts in run.tool_calls:
                 await queue.put(("tool_call", ts))
-                async for _delta in ts:  # drain required — see module docstring
+                async for _ in ts:  # drain required — see module docstring
                     pass
                 if ts.error is not None:
                     await queue.put(("tool_error", ts))
@@ -407,6 +442,19 @@ async def stream_agent(
                         yield out
             # Both pumps exhausted: reap them (propagates pump exceptions).
             await asyncio.gather(*pumps)
+            # HITL: the run ends when the graph pauses on an interrupt. The
+            # v3 run stream collects the payloads — surface them as SSE
+            # ``interrupt`` events and skip the done event (not done).
+            interrupts = await run.interrupts()
+            if interrupts:
+                for item in interrupts:
+                    # v3 returns Interrupt objects; the human-facing payload
+                    # is their .value (the dict passed to interrupt()).
+                    value = getattr(item, "value", item)
+                    for out in mapper.feed_interrupt(value):
+                        if out:
+                            yield out
+                return
             yield mapper.done_event()
         finally:
             for pump in pumps:

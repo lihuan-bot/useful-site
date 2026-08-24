@@ -37,13 +37,28 @@ Redis layout (prefix ``stream``):
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
 
 import redis.asyncio as aioredis
+from redis.asyncio.retry import Retry
+from redis.backoff import ExponentialBackoff
+
+logger = logging.getLogger(__name__)
 
 STREAM_END = "__stream_end__"
+
+# redis-py 8 defaults socket_timeout to 5s — far too tight for the SSH tunnel
+# to the remote Redis (mobile broadband → Tencent Cloud). Transient TCP stalls
+# of a minute or more are routine; raise the timeout and retry transient
+# errors (ConnectionError/TimeoutError) on a fresh connection. The built-in
+# default retry (10× with 10ms→1s jittered backoff) only survives ~55s of
+# stall alongside the 5s timeout; this survives ~2.5min.
+REDIS_SOCKET_TIMEOUT = 30.0
+REDIS_RETRY = Retry(ExponentialBackoff(cap=30.0, base=1.0), 4)
 
 KEEPALIVE_SECONDS = 15.0
 KEEPALIVE_MS = int(KEEPALIVE_SECONDS * 1000)
@@ -75,8 +90,16 @@ class StreamStore:
     def __init__(self, redis_url: str, prefix: str = "stream") -> None:
         self._url = redis_url
         self._prefix = prefix
-        self._r = aioredis.Redis.from_url(redis_url)
+        self._r = self._make_client(redis_url)
         self._acquire_script = self._r.register_script(_USER_ACQUIRE_LUA)
+
+    @staticmethod
+    def _make_client(redis_url: str) -> aioredis.Redis:
+        return aioredis.Redis.from_url(
+            redis_url,
+            socket_timeout=REDIS_SOCKET_TIMEOUT,
+            retry=REDIS_RETRY,
+        )
 
     def _k(self, kind: str, key: str) -> str:
         return f"{self._prefix}:{kind}:{key}"
@@ -186,7 +209,7 @@ class StreamStore:
         connection so cancelling the generator (client disconnect) closes a
         socket we don't share.
         """
-        client = aioredis.Redis.from_url(self._url)
+        client = self._make_client(self._url)
         cursor: bytes | str = b"0-0"
         end_raw = end_marker.encode() if end_marker else None
         try:
@@ -256,21 +279,31 @@ class StreamStore:
         await self._r.set(self._k("stopreq", conv_key), "1", ex=60)
 
     async def wait_stop(self, conv_key: str) -> None:
-        # Subscribe first so a publish between the stopreq check and the
-        # subscribe is still seen.
-        pubsub = self._r.pubsub()
-        await pubsub.subscribe(self._k("stop", conv_key))
-        try:
-            if await self._r.delete(self._k("stopreq", conv_key)):
-                return  # stop requested before we subscribed
-            while True:
-                msg = await pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=1.0
-                )
-                if msg is not None and msg.get("type") == "message":
-                    return
-        finally:
-            await pubsub.aclose()
+        # A Redis blip must not surface as "stop requested": the producer
+        # treats this task completing as a /stop signal and would cancel the
+        # run. Retry the whole subscribe loop on transient errors instead.
+        while True:
+            # Subscribe first so a publish between the stopreq check and the
+            # subscribe is still seen.
+            pubsub = self._r.pubsub()
+            try:
+                await pubsub.subscribe(self._k("stop", conv_key))
+                if await self._r.delete(self._k("stopreq", conv_key)):
+                    return  # stop requested before we subscribed
+                while True:
+                    msg = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=1.0
+                    )
+                    if msg is not None and msg.get("type") == "message":
+                        return
+            except aioredis.RedisError:
+                logger.warning("wait_stop redis error, reconnecting: conv=%s", conv_key)
+                await asyncio.sleep(2.0)
+            finally:
+                try:
+                    await pubsub.aclose()
+                except aioredis.RedisError:
+                    pass
 
     # -- per-user concurrency ------------------------------------------
 

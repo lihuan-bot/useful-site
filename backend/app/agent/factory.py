@@ -14,6 +14,7 @@ from functools import lru_cache
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from app.agent.middleware.field_collect import FieldCollectMiddleware
 from app.agent.prompts import AGENT_SYSTEM_PROMPT
 from app.core.config import Settings, get_settings
 from app.services.skill_md import parse_skill_md
@@ -131,7 +132,12 @@ def build_agent(
     # are visible in logs immediately.
     _log_skills_diagnostic(backend)
 
-    middleware = [TodoListMiddleware()] if settings.agent_todos_enabled else None
+    # FieldCollectMiddleware is the generic HITL mechanism: business tools
+    # declare their required fields (see app/agent/middleware/field_collect.py);
+    # missing/invalid args pause the graph until a human completes them.
+    middleware: list = [FieldCollectMiddleware()]
+    if settings.agent_todos_enabled:
+        middleware.append(TodoListMiddleware())
     agent = create_deep_agent(
         model=llm,
         tools=tools or [],

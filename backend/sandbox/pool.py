@@ -54,6 +54,8 @@ from datetime import timedelta
 from typing import ClassVar
 
 import redis
+from redis.backoff import ExponentialBackoff
+from redis.retry import Retry
 
 from deepagents.backends.protocol import (
     ExecuteResponse,
@@ -157,9 +159,16 @@ class PreheatedSyncOpenSandboxBackend(BaseSandbox):
         # Shared Redis state store: all workers draw from one idle buffer;
         # the primary lock (real with Redis) lets only one worker's
         # reconciler warm/reap. A sync client is correct here — the pool is
-        # thread-based and never touches the event loop.
+        # thread-based and never touches the event loop. The 30s socket
+        # timeout + retries match stream_store: redis-py 8's 5s default is
+        # too tight for the SSH tunnel to the remote Redis.
         state_store = RedisPoolStateStore(
-            redis.Redis.from_url(redis_url, socket_connect_timeout=10)
+            redis.Redis.from_url(
+                redis_url,
+                socket_connect_timeout=10,
+                socket_timeout=30,
+                retry=Retry(ExponentialBackoff(cap=30.0, base=1.0), 4),
+            )
         )
         pool = SandboxPoolSync(
             pool_name=pool_name,

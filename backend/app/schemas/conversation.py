@@ -63,3 +63,9 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     conversation_id: UUID
     message: MessageOut
+
+
+class ResumeRequest(BaseModel):
+    """HITL resume: the human's answers to an interrupt prompt."""
+
+    answers: dict = Field(default_factory=dict)

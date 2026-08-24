@@ -178,3 +178,25 @@ class Chunk(Base):
 
 # HNSW index is created in the Alembic migration (CREATE INDEX ... USING hnsw)
 # because it references the vector_cosine_ops operator class.
+
+
+class FormSubmission(Base):
+    """Demo HITL scenario: order form written only after the human fills the
+    missing fields (see ``app/tools/order_form.py`` — the tool interrupts the
+    graph until every required field is present)."""
+
+    __tablename__ = "form_submissions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=func.gen_random_uuid()
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
+    )
+    receiver_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    receiver_phone: Mapped[str] = mapped_column(String(32), nullable=False)
+    address: Mapped[str] = mapped_column(Text, nullable=False)
+    items: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

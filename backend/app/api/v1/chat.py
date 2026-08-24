@@ -12,12 +12,14 @@ see ``app/services/stream_store.py``).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from langgraph.types import Command
 from sqlalchemy.orm import Session
 
 from app.agent.backend_factory import build_backend_sync, kill_sandbox
@@ -34,7 +36,7 @@ from app.core.deps import get_current_user, get_s3
 from app.db import session as db_session
 from app.db.models import User
 from app.db.session import get_db
-from app.schemas.conversation import ChatRequest, ChatResponse, MessageOut
+from app.schemas.conversation import ChatRequest, ChatResponse, MessageOut, ResumeRequest
 from app.services import conversation_service as svc
 from app.services.stream_store import STREAM_END, StreamStore
 from app.tools.registry import build_tools
@@ -77,7 +79,7 @@ async def _prepare_run(request: Request, user: User, conversation_id: uuid.UUID)
             llm=get_llm(),
             backend=backend,
             checkpointer=request.app.state.checkpointer.saver,
-            tools=build_tools(user, request.app.state.rag_service),
+            tools=build_tools(user, request.app.state.rag_service, conversation_id),
         )
     except Exception:
         await kill_sandbox(sandbox)
@@ -144,7 +146,7 @@ async def _produce_events(
     mapper: SSEEventMapper,
     conv_id: uuid.UUID,
     stream_msg_id: uuid.UUID,
-    user_content,
+    run_input,
     config: dict,
     thread_id: str,
     user_key: str,
@@ -169,15 +171,19 @@ async def _produce_events(
     last_mirror = 0.0
 
     # Notify the user's status channel: the conversation list lights up this
-    # conversation's spinner without polling.
-    await store.publish_status(
-        user_key,
-        sse("conversation_status", {"conversation_id": conv_key, "status": "running"}),
-    )
+    # conversation's spinner without polling. Wrapped so a Redis blip right
+    # at producer start doesn't kill the detached task without cleanup.
+    try:
+        await store.publish_status(
+            user_key,
+            sse("conversation_status", {"conversation_id": conv_key, "status": "running"}),
+        )
+    except Exception:
+        logger.exception("failed to publish running status: thread=%s", thread_id)
 
     async def run_stream() -> None:
         nonlocal completed, last_mirror
-        async for event in stream_agent(agent, mapper, content=user_content, config=config):
+        async for event in stream_agent(agent, mapper, run_input=run_input, config=config):
             if event.startswith(": keepalive"):
                 # Keepalives are the subscriber's job; don't pollute the replay log.
                 continue
@@ -193,7 +199,13 @@ async def _produce_events(
     async def heartbeat() -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-            await store.heartbeat(conv_key)
+            try:
+                await store.heartbeat(conv_key)
+            except Exception:
+                # A transient Redis error must not kill the refresher: with it
+                # gone the reservation lock expires mid-run and single-flight /
+                # subscriber liveness checks break.
+                logger.warning("heartbeat refresh failed: thread=%s", thread_id, exc_info=True)
 
     stream_task = asyncio.create_task(run_stream())
     heartbeat_task = asyncio.create_task(heartbeat())
@@ -235,21 +247,35 @@ async def _produce_events(
                     "conversation_status",
                     {
                         "conversation_id": conv_key,
-                        "status": "done" if completed else "interrupted",
+                        # HITL: a paused graph awaiting human input gets its
+                        # own status so the list can show "等待补充".
+                        "status": (
+                            "done" if completed
+                            else "awaiting_input" if mapper.interrupted
+                            else "interrupted"
+                        ),
                     },
                 ),
             )
         except Exception:
             logger.exception("failed to publish conversation status")
         request.app.state.active_streams.pop(conv_key, None)
-        await store.release(conv_key)
-        await store.user_release(user_key, conv_key)
+        try:
+            await store.release(conv_key)
+            await store.user_release(user_key, conv_key)
+        except Exception:
+            # A still-broken Redis must not abort sandbox/DB cleanup, nor
+            # leave the user's ZSET slot stuck (until its 2h TTL) causing 429s.
+            logger.exception("failed to release stream reservations: thread=%s", thread_id)
         await kill_sandbox(sandbox)
+        final_text = mapper.assistant_text or "(no response)"
+        if mapper.interrupted:
+            final_text += "\n\n⏸ 等待补充信息"
         try:
             await asyncio.to_thread(
                 svc.finalize_stream_message,
                 mirror_db, conv_id, stream_msg_id,
-                mapper.assistant_text or "(no response)", completed,
+                final_text, completed,
             )
         except Exception:
             logger.exception("failed to finalize assistant message")
@@ -328,7 +354,7 @@ async def stream_chat(
         mapper=mapper,
         conv_id=conv.id,
         stream_msg_id=stream_msg.id,
-        user_content=user_content,
+        run_input={"messages": [{"role": "user", "content": user_content}]},
         config=config,
         thread_id=thread_id,
         user_key=user_key,
@@ -368,6 +394,82 @@ async def attach_stream(
         return _sse_stream(status_only)
 
     return _sse_stream(store.follow(str(conversation_id)))
+
+
+@router.post("/conversations/{conversation_id}/resume")
+async def resume_generation(
+    conversation_id: uuid.UUID,
+    body: ResumeRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """HITL resume: continue a paused (interrupted) generation.
+
+    The agent graph is paused at an ``interrupt()`` checkpoint; the human's
+    answers arrive here and the same thread continues via
+    ``Command(resume=...)``. The interrupted tool re-validates — if fields
+    are still missing/invalid it interrupts AGAIN, otherwise it finishes and
+    the agent keeps executing the rest of its flow. Streams exactly like a
+    normal turn (new generation, same conversation).
+    """
+    conv = svc.get_or_404(db, conversation_id, user.id)
+    conv_key = str(conv.id)
+    store: StreamStore = request.app.state.stream_store
+    user_key = str(user.id)
+    settings = get_settings()
+
+    if not await store.reserve(conv_key, user_key):
+        raise HTTPException(status_code=409, detail="该会话已有进行中的生成")
+    try:
+        if not await store.user_acquire(user_key, conv_key, settings.max_concurrent_agents_per_user):
+            raise HTTPException(status_code=429, detail="并发会话数已达上限，请稍候")
+    except BaseException:
+        await store.release(conv_key)
+        raise
+
+    try:
+        # Mirror the human's补充 as a user message (display trace only — the
+        # graph state itself resumes from the checkpoint).
+        svc.add_message(
+            db, conv.id, "user",
+            f"[已补充信息] {json.dumps(body.answers, ensure_ascii=False)}",
+        )
+        svc.touch_conversation(db, conv.id)
+
+        agent, sandbox, thread_id = await _prepare_run(request, user, conv.id)
+        stream_msg = svc.create_stream_message(db, conv.id)
+        await store.begin_generation(conv_key)
+    except Exception:
+        await store.user_release(user_key, conv_key)
+        await store.release(conv_key)
+        raise
+
+    config = {"configurable": {"thread_id": thread_id}}
+    mapper = SSEEventMapper(
+        conversation_id=str(conv.id),
+        thread_id=thread_id,
+        base_url=str(request.base_url),
+    )
+    producer = asyncio.create_task(_produce_events(
+        request=request,
+        store=store,
+        agent=agent,
+        sandbox=sandbox,
+        mapper=mapper,
+        conv_id=conv.id,
+        stream_msg_id=stream_msg.id,
+        run_input=Command(resume=body.answers),
+        config=config,
+        thread_id=thread_id,
+        user_key=user_key,
+    ))
+    request.app.state.active_streams[conv_key] = producer
+    logger.info(
+        "agent resume start: conversation=%s thread=%s answers=%d",
+        conv.id, thread_id, len(body.answers),
+    )
+    return _sse_stream(store.follow(conv_key))
 
 
 @router.post("/conversations/{conversation_id}/stop")
