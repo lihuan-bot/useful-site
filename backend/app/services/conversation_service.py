@@ -105,17 +105,20 @@ def finalize_stream_message(
     message_id: uuid.UUID,
     content: str,
     is_complete: bool,
+    artifacts: list[str] | None = None,
 ) -> None:
-    """Final content + completeness flip; bumps the conversation's updated_at."""
+    """Final content + completeness flip；持久化交付物路径。
+
+    注意：不 bump 会话的 updated_at——列表按 updated_at 排序，若在生成
+    完成时再 bump 一次，后台完成的会话会突然插到用户正在使用的会话上方，
+    列表顺序会「自己跳动」。位置只由发送时刻决定（POST 时已 touch）。
+    """
+    del conversation_id  # 保留参数兼容调用方；不再用于 bump（见 docstring）
+    values: dict = {"content": content, "is_complete": is_complete}
+    if artifacts is not None:
+        values["artifacts"] = artifacts
     db.execute(
-        update(Message)
-        .where(Message.id == message_id)
-        .values(content=content, is_complete=is_complete)
-    )
-    db.execute(
-        update(Conversation)
-        .where(Conversation.id == conversation_id)
-        .values(updated_at=func.now())
+        update(Message).where(Message.id == message_id).values(**values)
     )
     db.commit()
 

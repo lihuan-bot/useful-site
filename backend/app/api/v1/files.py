@@ -10,6 +10,7 @@ import mimetypes
 import posixpath
 import uuid
 from datetime import datetime
+from urllib.parse import quote
 
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -36,7 +37,7 @@ def list_files(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
-    """List all files under the user's ``/files/`` area."""
+    """List all files under the user's ``/files/`` area（按修改时间倒序）。"""
     s3 = get_s3(request)
     bucket = get_bucket()
     prefix = f"{user_files_prefix(str(user.id))}/"
@@ -50,6 +51,9 @@ def list_files(
             "last_modified": obj.get("LastModified").isoformat() if obj.get("LastModified") else None,
         })
 
+    # S3 LIST 按 key 字典序返回（日期目录升序=旧的在前），按时间倒序排：
+    # 最新文件在最前。ISO 字符串字典序即时间序；None（无时间）排最后。
+    files.sort(key=lambda f: f["last_modified"] or "", reverse=True)
     return {"items": files, "total": len(files)}
 
 
@@ -140,8 +144,15 @@ def download_file(
 
     filename = posixpath.basename(clean)
     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    # HTTP 响应头只支持 latin-1：中文文件名直接放进 filename 会抛
+    # UnicodeEncodeError（表现为 500）。按 RFC 5987 用 filename* 传 UTF-8
+    # 文件名，ASCII 回退名兜底。
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "download"
+    disposition = (
+        f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+    )
     return StreamingResponse(
         resp["Body"],
         media_type=content_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": disposition},
     )

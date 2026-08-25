@@ -38,6 +38,8 @@ class MessageOut(BaseModel):
     role: str
     content: str
     is_complete: bool
+    artifacts: list[str] | None = None
+    """agent 交付物路径列表（/files/... 前缀），刷新后据此恢复下载卡片"""
     created_at: datetime
 
     model_config = {"from_attributes": True}

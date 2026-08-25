@@ -47,7 +47,7 @@ from langchain.agents.middleware.types import (
 )
 
 from app.services.storage import ALLOWED_IMAGE_EXT, safe_relative_path
-
+from langgraph.stream.run_stream import AsyncGraphRunStream
 
 logger = logging.getLogger(__name__)
 
@@ -376,7 +376,7 @@ async def stream_agent(
     ``mapper.assistant_text`` / ``mapper.interrupted`` afterwards) and
     backend cleanup (finally) — see the chat endpoint.
     """
-    run = await agent.astream_events(
+    run:AsyncGraphRunStream = await agent.astream_events(
         run_input,
         config=config,
         version="v3",

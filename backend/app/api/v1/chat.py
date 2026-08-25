@@ -272,11 +272,13 @@ async def _produce_events(
         final_text = mapper.assistant_text or "(no response)"
         if mapper.interrupted:
             final_text += "\n\n⏸ 等待补充信息"
+        # 持久化交付物路径：刷新后从 DB 拉消息也能恢复下载卡片
+        artifact_paths = mapper.artifact_paths or None
         try:
             await asyncio.to_thread(
                 svc.finalize_stream_message,
                 mirror_db, conv_id, stream_msg_id,
-                final_text, completed,
+                final_text, completed, artifact_paths,
             )
         except Exception:
             logger.exception("failed to finalize assistant message")

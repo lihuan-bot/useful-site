@@ -1,0 +1,211 @@
+@import "tailwindcss";
+
+/*
+ * 设计令牌 —— 参考豆包网页版的浅色风格:
+ * 蓝紫主色、浅灰页面底、白色卡片、细边框。
+ */
+@theme {
+  --color-primary: #4e6ef2;
+  --color-primary-hover: #4561e8;
+  --color-primary-soft: #eef2ff;
+  --color-primary-softer: #f5f7ff;
+
+  --color-page: #f7f8fa;
+  --color-card: #ffffff;
+  --color-line: #e5e6eb;
+  --color-line-soft: #f0f1f4;
+
+  --color-ink: #1d2129;
+  --color-ink-2: #4e5969;
+  --color-ink-3: #86909c;
+
+  --color-user-bubble: #eaf1ff;
+
+  --animate-toast-in: toast-in 0.2s ease-out;
+  --animate-fade-up: fade-up 0.25s ease-out;
+  --animate-pulse-dot: pulse-dot 1.2s ease-in-out infinite;
+
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes fade-up {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes pulse-dot {
+    0%,
+    100% {
+      opacity: 0.4;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-page);
+  color: var(--color-ink);
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "PingFang SC",
+    "Hiragino Sans GB",
+    "Microsoft YaHei",
+    "Segoe UI",
+    Roboto,
+    "Helvetica Neue",
+    Arial,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 细滚动条 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #d0d3d9 transparent;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #d0d3d9;
+  border-radius: 3px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 流式输出光标 */
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+.streaming-cursor::after {
+  content: "▍";
+  margin-left: 1px;
+  color: var(--color-primary);
+  animation: blink 1s step-end infinite;
+}
+
+/* ---- Markdown 正文样式（.md） ---- */
+
+.md {
+  font-size: 14.5px;
+  line-height: 1.8;
+  word-break: break-word;
+}
+.md > *:first-child {
+  margin-top: 0;
+}
+.md > *:last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0.5em 0;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  font-weight: 600;
+  margin: 1em 0 0.5em;
+  line-height: 1.4;
+}
+.md h1 {
+  font-size: 1.3em;
+}
+.md h2 {
+  font-size: 1.2em;
+}
+.md h3 {
+  font-size: 1.1em;
+}
+.md ul {
+  list-style: disc;
+  padding-left: 1.4em;
+  margin: 0.5em 0;
+}
+.md ol {
+  list-style: decimal;
+  padding-left: 1.4em;
+  margin: 0.5em 0;
+}
+.md li {
+  margin: 0.2em 0;
+}
+.md li::marker {
+  color: var(--color-ink-3);
+}
+.md blockquote {
+  border-left: 3px solid var(--color-line);
+  padding-left: 0.8em;
+  color: var(--color-ink-2);
+  margin: 0.6em 0;
+}
+.md table {
+  border-collapse: collapse;
+  margin: 0.8em 0;
+  width: 100%;
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+.md th,
+.md td {
+  border: 1px solid var(--color-line);
+  padding: 6px 10px;
+  text-align: left;
+}
+.md th {
+  background: var(--color-page);
+  font-weight: 600;
+}
+.md a {
+  color: var(--color-primary);
+  text-decoration: none;
+}
+.md a:hover {
+  text-decoration: underline;
+}
+.md hr {
+  border: none;
+  border-top: 1px solid var(--color-line);
+  margin: 1em 0;
+}
+.md img {
+  max-width: 100%;
+  border-radius: 8px;
+}
+.md-inline-code {
+  background: #f2f3f5;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-size: 0.88em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}

@@ -24,6 +24,7 @@ from sqlalchemy import (
     Uuid,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -106,6 +107,9 @@ class Message(Base):
     is_complete: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="true"
     )
+    # agent 通过 write_file 生成的交付物路径列表（/files/... 前缀）。
+    # 生成时经 SSE artifact 事件下发，这里持久化保证刷新后仍可见。
+    artifacts: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
